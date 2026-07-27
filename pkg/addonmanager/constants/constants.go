@@ -13,6 +13,13 @@ const (
 	InstallModeBuiltinValueKey = "InstallMode"
 	InstallModeHosted          = "Hosted"
 	InstallModeDefault         = "Default"
+
+	// AddonFrameworkManagedByLabelKey identifies ManifestWorks reconciled by addon-framework.
+	AddonFrameworkManagedByLabelKey = "addon.open-cluster-management.io/managed-by"
+	// AddonFrameworkManagedByLabelValue is the value used for ManifestWorks reconciled by addon-framework.
+	AddonFrameworkManagedByLabelValue = "addon-framework"
+	// AddonFrameworkSourceUIDLabelKey records the UID of the source ManagedClusterAddOn.
+	AddonFrameworkSourceUIDLabelKey = "addon.open-cluster-management.io/source-uid"
 )
 
 // DeployWorkNamePrefix returns the prefix of the work name for the addon

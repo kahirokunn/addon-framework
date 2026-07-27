@@ -31,6 +31,7 @@ const (
 	ManifestWorkByAddon           = "manifestWorkByAddon"
 	ManifestWorkByHostedAddon     = "manifestWorkByHostedAddon"
 	ManifestWorkHookByHostedAddon = "manifestWorkHookByHostedAddon"
+	ManifestWorkByAddonIdentity   = "manifestWorkByAddonIdentity"
 )
 
 //nolint:revive
@@ -40,13 +41,14 @@ func IndexManifestWorkByAddon(obj interface{}) ([]string, error) {
 		return []string{}, fmt.Errorf("obj is supposed to be a ManifestWork, but is %T", obj)
 	}
 
-	addonName, addonNamespace, isHook := extractAddonFromWork(work)
+	addonName, addonNamespace, isHosted, isHook := extractAddonFromWork(work)
+	isDeploy := strings.HasPrefix(work.Name, constants.DeployWorkNamePrefix(addonName))
 
-	if len(addonName) == 0 || len(addonNamespace) > 0 || isHook {
+	if len(addonName) == 0 || !isDeploy || isHosted || isHook {
 		return []string{}, nil
 	}
 
-	return []string{fmt.Sprintf("%s/%s", work.Namespace, addonName)}, nil
+	return []string{fmt.Sprintf("%s/%s", addonNamespace, addonName)}, nil
 }
 
 //nolint:revive
@@ -56,9 +58,10 @@ func IndexManifestWorkByHostedAddon(obj interface{}) ([]string, error) {
 		return []string{}, fmt.Errorf("obj is supposed to be a ManifestWork, but is %T", obj)
 	}
 
-	addonName, addonNamespace, isHook := extractAddonFromWork(work)
+	addonName, addonNamespace, isHosted, isHook := extractAddonFromWork(work)
+	isDeploy := strings.HasPrefix(work.Name, constants.DeployWorkNamePrefix(addonName))
 
-	if len(addonName) == 0 || len(addonNamespace) == 0 || isHook {
+	if len(addonName) == 0 || !isDeploy || !isHosted || isHook {
 		return []string{}, nil
 	}
 
@@ -72,30 +75,54 @@ func IndexManifestWorkHookByHostedAddon(obj interface{}) ([]string, error) {
 		return []string{}, fmt.Errorf("obj is supposed to be a ManifestWork, but is %T", obj)
 	}
 
-	addonName, addonNamespace, isHook := extractAddonFromWork(work)
+	addonName, addonNamespace, isHosted, isHook := extractAddonFromWork(work)
 
-	if len(addonName) == 0 || len(addonNamespace) == 0 || !isHook {
+	if len(addonName) == 0 || !isHosted || !isHook {
 		return []string{}, nil
 	}
 
 	return []string{fmt.Sprintf("%s/%s", addonNamespace, addonName)}, nil
 }
 
-func extractAddonFromWork(work *workapiv1.ManifestWork) (string, string, bool) {
+// IndexManifestWorkByAddonIdentity indexes every addon-framework deploy and hook ManifestWork by its source addon.
+func IndexManifestWorkByAddonIdentity(obj interface{}) ([]string, error) {
+	work, ok := obj.(*workapiv1.ManifestWork)
+	if !ok {
+		return []string{}, fmt.Errorf("obj is supposed to be a ManifestWork, but is %T", obj)
+	}
+
+	addonName, addonNamespace, _, _ := extractAddonFromWork(work)
+	if len(addonName) == 0 || !isAddonFrameworkWorkName(work.Name, addonName) {
+		return []string{}, nil
+	}
+
+	return []string{fmt.Sprintf("%s/%s", addonNamespace, addonName)}, nil
+}
+
+func extractAddonFromWork(work *workapiv1.ManifestWork) (addonName, addonNamespace string, isHosted, isHook bool) {
 	if len(work.Labels) == 0 {
-		return "", "", false
+		return "", "", false, false
 	}
 
 	addonName, ok := work.Labels[addonv1beta1.AddonLabelKey]
 	if !ok {
-		return "", "", false
+		return "", "", false, false
 	}
 
-	addonNamespace := work.Labels[addonv1beta1.AddonNamespaceLabelKey]
+	addonNamespace = work.Labels[addonv1beta1.AddonNamespaceLabelKey]
+	if addonNamespace == "" {
+		addonNamespace = work.Namespace
+	}
 
-	isHook := strings.HasPrefix(work.Name, constants.PreDeleteHookWorkName(addonName))
+	isHosted = addonNamespace != work.Namespace
+	isHook = strings.HasPrefix(work.Name, constants.PreDeleteHookWorkName(addonName))
 
-	return addonName, addonNamespace, isHook
+	return addonName, addonNamespace, isHosted, isHook
+}
+
+func isAddonFrameworkWorkName(workName, addonName string) bool {
+	return strings.HasPrefix(workName, constants.DeployWorkNamePrefix(addonName)) ||
+		strings.HasPrefix(workName, constants.PreDeleteHookWorkName(addonName))
 }
 
 const (

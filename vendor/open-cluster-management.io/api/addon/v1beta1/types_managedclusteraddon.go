@@ -335,7 +335,12 @@ const (
 	// applied correctly.
 	ManagedClusterAddOnManifestApplied = "ManifestApplied"
 
+	// ManagedClusterAddOnPreDeleteHookCompleted is a condition type representing whether all pre-delete hook
+	// manifests for the addon are completed.
+	ManagedClusterAddOnPreDeleteHookCompleted = "PreDeleteHookCompleted"
+
 	// ManagedClusterAddOnHookManifestCompleted is a condition type representing whether the addon hook is completed.
+	// Deprecated: use ManagedClusterAddOnPreDeleteHookCompleted instead.
 	ManagedClusterAddOnHookManifestCompleted = "HookManifestCompleted"
 
 	// ManagedClusterAddOnHostingManifestApplied is a condition type representing whether the manifest of an addon
@@ -349,6 +354,15 @@ const (
 	// ManagedClusterAddOnRegistrationApplied is a condition type representing whether the registration of
 	// the addon agent is configured.
 	ManagedClusterAddOnRegistrationApplied = "RegistrationApplied"
+)
+
+// the reasons of condition ManagedClusterAddOnPreDeleteHookCompleted
+const (
+	// PreDeleteHookReasonPending indicates that at least one pre-delete hook manifest is not completed.
+	PreDeleteHookReasonPending = "PreDeleteHookPending"
+
+	// PreDeleteHookReasonCompleted indicates that all pre-delete hook manifests are completed.
+	PreDeleteHookReasonCompleted = "PreDeleteHookCompleted"
 )
 
 // the reasons of condition ManagedClusterAddOnConditionAvailable

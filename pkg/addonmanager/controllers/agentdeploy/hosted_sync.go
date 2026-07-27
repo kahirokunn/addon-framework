@@ -28,6 +28,8 @@ type hostedSyncer struct {
 
 	getWorkByAddon func(addonName, addonNamespace string) ([]*workapiv1.ManifestWork, error)
 
+	listWorkByAddon listWorksByAddonFunc
+
 	getCluster func(clusterName string) (*clusterv1.ManagedCluster, error)
 
 	agentAddon agent.AgentAddon
@@ -37,21 +39,19 @@ func (s *hostedSyncer) sync(ctx context.Context,
 	syncCtx factory.SyncContext,
 	cluster *clusterv1.ManagedCluster,
 	addon *addonapiv1beta1.ManagedClusterAddOn) (*addonapiv1beta1.ManagedClusterAddOn, error) {
-	// Hosted mode is not enabled, will not deploy any resource on the hosting cluster
-	if !s.agentAddon.GetAgentAddonOptions().HostedModeEnabled {
+	options := s.agentAddon.GetAgentAddonOptions()
+	if !options.HostedModeEnabled || options.HostedModeInfoFunc == nil {
+		if err := s.cleanupDeployWork(ctx, addon); err != nil {
+			return addon, err
+		}
 		return addon, nil
 	}
-
-	if s.agentAddon.GetAgentAddonOptions().HostedModeInfoFunc == nil {
-		return addon, nil
-	}
-	installMode, hostingClusterName := s.agentAddon.GetAgentAddonOptions().HostedModeInfoFunc(addon, cluster)
+	installMode, hostingClusterName := options.HostedModeInfoFunc(addon, cluster)
 	if installMode != constants.InstallModeHosted {
 		// the installMode is changed from hosted to default, cleanup the hosting resources
 		if err := s.cleanupDeployWork(ctx, addon); err != nil {
 			return addon, err
 		}
-		addonRemoveFinalizer(addon, addonapiv1beta1.AddonHostingManifestFinalizer)
 		return addon, nil
 	}
 
@@ -70,7 +70,6 @@ func (s *hostedSyncer) sync(ctx context.Context,
 			Message: fmt.Sprintf("hosting cluster %s is not a managed cluster of the hub", hostingClusterName),
 		})
 
-		addonRemoveFinalizer(addon, addonapiv1beta1.AddonHostingManifestFinalizer)
 		return addon, nil
 	}
 	if err != nil {
@@ -83,22 +82,20 @@ func (s *hostedSyncer) sync(ctx context.Context,
 		Message: fmt.Sprintf("hosting cluster %s is a managed cluster of the hub", hostingClusterName),
 	})
 
+	if !hostingCluster.DeletionTimestamp.IsZero() {
+		if err = s.cleanupDeployWork(ctx, addon); err != nil {
+			return addon, err
+		}
+		return addon, nil
+	}
+
 	// Don't skip syncing if the addon is deleting and there is a predelete hook, since the deployment manifests may
 	// need to be updated during the uninstall.
 	if !addonHasFinalizer(addon, addonapiv1beta1.AddonHostingPreDeleteHookFinalizer) {
-		if !hostingCluster.DeletionTimestamp.IsZero() {
-			if err = s.cleanupDeployWork(ctx, addon); err != nil {
-				return addon, err
-			}
-			addonRemoveFinalizer(addon, addonapiv1beta1.AddonHostingManifestFinalizer)
-			return addon, nil
-		}
-
 		if !addon.DeletionTimestamp.IsZero() {
 			if err = s.cleanupDeployWork(ctx, addon); err != nil {
 				return addon, err
 			}
-			addonRemoveFinalizer(addon, addonapiv1beta1.AddonHostingManifestFinalizer)
 			return addon, nil
 		}
 
@@ -117,11 +114,13 @@ func (s *hostedSyncer) sync(ctx context.Context,
 	if err != nil {
 		return addon, err
 	}
+	currentWorks, staleWorks := partitionWorksForTarget(addon, hostingClusterName, currentWorks)
 
 	deployWorks, deleteWorks, err := s.buildWorks(ctx, hostingClusterName, cluster, currentWorks, addon)
 	if err != nil {
 		return addon, err
 	}
+	deleteWorks = append(staleWorks, deleteWorks...)
 
 	var errs []error
 	for _, deleteWork := range deleteWorks {
@@ -129,6 +128,9 @@ func (s *hostedSyncer) sync(ctx context.Context,
 		if err != nil {
 			errs = append(errs, err)
 		}
+	}
+	if len(errs) != 0 {
+		return addon, utilerrors.NewAggregate(errs)
 	}
 
 	for _, deployWork := range deployWorks {
@@ -145,13 +147,14 @@ func (s *hostedSyncer) sync(ctx context.Context,
 // to find out the hosting cluster by manifestWork labels and do the cleanup.
 func (s *hostedSyncer) cleanupDeployWork(ctx context.Context,
 	addon *addonapiv1beta1.ManagedClusterAddOn) (err error) {
-	if !addonHasFinalizer(addon, addonapiv1beta1.AddonHostingManifestFinalizer) {
-		return nil
-	}
-
 	currentWorks, err := s.getWorkByAddon(addon.Name, addon.Namespace)
 	if err != nil {
 		return err
+	}
+	currentWorks = ownedWorks(currentWorks)
+	if len(currentWorks) == 0 &&
+		!addonHasFinalizer(addon, addonapiv1beta1.AddonHostingManifestFinalizer) {
+		return nil
 	}
 
 	var errs []error
@@ -161,6 +164,13 @@ func (s *hostedSyncer) cleanupDeployWork(ctx context.Context,
 			errs = append(errs, err)
 		}
 	}
+	if aggregate := utilerrors.NewAggregate(errs); aggregate != nil {
+		return aggregate
+	}
 
-	return utilerrors.NewAggregate(errs)
+	liveWorks, err := s.listWorkByAddon(ctx, addon.Name, addon.Namespace)
+	if err != nil {
+		return err
+	}
+	return verifyWorkDeletionStarted(liveWorks)
 }

@@ -24,6 +24,7 @@ import (
 	clusterv1informers "open-cluster-management.io/api/client/cluster/informers/externalversions"
 	fakework "open-cluster-management.io/api/client/work/clientset/versioned/fake"
 	workinformers "open-cluster-management.io/api/client/work/informers/externalversions"
+	clusterv1 "open-cluster-management.io/api/cluster/v1"
 	workapiv1 "open-cluster-management.io/api/work/v1"
 	workapplier "open-cluster-management.io/sdk-go/pkg/apis/work/v1/applier"
 	workbuilder "open-cluster-management.io/sdk-go/pkg/apis/work/v1/builder"
@@ -46,6 +47,56 @@ func getHostedDeployWork() *workapiv1.ManifestWork {
 	return work
 }
 
+func getHostedHookWork(completed bool) *workapiv1.ManifestWork {
+	work := addontesting.NewManifestWork(
+		constants.PreDeleteHookHostingWorkName("cluster1", "test"),
+		"cluster2",
+		addontesting.NewHostedHookJob("test", "default"),
+	)
+	work.Labels = map[string]string{
+		addonapiv1beta1.AddonLabelKey:          "test",
+		addonapiv1beta1.AddonNamespaceLabelKey: "cluster1",
+	}
+	work.Spec.ManifestConfigs = []workapiv1.ManifestConfigOption{{
+		ResourceIdentifier: workapiv1.ResourceIdentifier{
+			Group:     "batch",
+			Resource:  "jobs",
+			Name:      "test",
+			Namespace: "default",
+		},
+		FeedbackRules: []workapiv1.FeedbackRule{{Type: workapiv1.WellKnownStatusType}},
+	}}
+	work.Status.Conditions = []metav1.Condition{
+		{Type: workapiv1.WorkApplied, Status: metav1.ConditionTrue},
+		{Type: workapiv1.WorkAvailable, Status: metav1.ConditionTrue},
+	}
+	jobComplete := "False"
+	if completed {
+		jobComplete = "True"
+	}
+	work.Status.ResourceStatus = workapiv1.ManifestResourceStatus{
+		Manifests: []workapiv1.ManifestCondition{{
+			ResourceMeta: workapiv1.ManifestResourceMeta{
+				Group:     "batch",
+				Version:   "v1",
+				Resource:  "jobs",
+				Name:      "test",
+				Namespace: "default",
+			},
+			StatusFeedbacks: workapiv1.StatusFeedbackResult{
+				Values: []workapiv1.FeedbackValue{{
+					Name: "JobComplete",
+					Value: workapiv1.FieldValue{
+						Type:   workapiv1.String,
+						String: pointer.String(jobComplete),
+					},
+				}},
+			},
+		}},
+	}
+	return work
+}
+
 func TestHostingHookReconcile(t *testing.T) {
 	cases := []struct {
 		name                 string
@@ -57,6 +108,92 @@ func TestHostingHookReconcile(t *testing.T) {
 		validateAddonActions func(t *testing.T, actions []clienttesting.Action)
 		validateWorkActions  func(t *testing.T, actions []clienttesting.Action)
 	}{
+		{
+			name: "cleanup phase persists status before releasing hosting finalizer",
+			key:  "cluster1/test",
+			addon: []runtime.Object{addontesting.SetAddonFinalizers(
+				addontesting.SetAddonDeletionTimestamp(
+					addontesting.NewHostedModeAddon(
+						"test",
+						"cluster1",
+						"cluster2",
+						registrationAppliedCondition,
+						metav1.Condition{
+							Type:   addonapiv1beta1.ManagedClusterAddOnPreDeleteHookCompleted,
+							Status: metav1.ConditionFalse,
+						},
+					),
+					time.Now(),
+				),
+				addonapiv1beta1.AddonHostingManifestFinalizer,
+			)},
+			cluster: []runtime.Object{
+				addontesting.NewManagedCluster("cluster1"),
+				addontesting.NewManagedCluster("cluster2"),
+			},
+			testaddon: &testHostedAgent{name: "test", objects: []runtime.Object{
+				addontesting.NewHostingUnstructured("v1", "ConfigMap", "default", "test"),
+				addontesting.NewHostedHookJob("test", "default"),
+			}},
+			existingWork: []runtime.Object{getHostedDeployWork(), getHostedHookWork(true)},
+			validateWorkActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "delete", "list", "delete", "list")
+			},
+			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "patch")
+			},
+		},
+		{
+			name: "ignore a stale completed condition while the hook Work is incomplete",
+			key:  "cluster1/test",
+			addon: []runtime.Object{addontesting.SetAddonFinalizers(
+				addontesting.SetAddonDeletionTimestamp(
+					addontesting.NewHostedModeAddon(
+						"test",
+						"cluster1",
+						"cluster2",
+						registrationAppliedCondition,
+						metav1.Condition{
+							Type:   addonapiv1beta1.ManagedClusterAddOnHookManifestCompleted,
+							Status: metav1.ConditionTrue,
+						},
+					),
+					time.Now(),
+				),
+				addonapiv1beta1.AddonHostingManifestFinalizer,
+				addonapiv1beta1.AddonHostingPreDeleteHookFinalizer,
+			)},
+			cluster: []runtime.Object{
+				addontesting.NewManagedCluster("cluster1"),
+				addontesting.NewManagedCluster("cluster2"),
+			},
+			testaddon: &testHostedAgent{name: "test", objects: []runtime.Object{
+				addontesting.NewHostingUnstructured("v1", "ConfigMap", "default", "test"),
+				addontesting.NewHostedHookJob("test", "default"),
+			}},
+			existingWork:        []runtime.Object{getHostedDeployWork(), getHostedHookWork(false)},
+			validateWorkActions: addontesting.AssertNoActions,
+			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "patch")
+				patch := actions[0].(clienttesting.PatchActionImpl).Patch
+				addOn := &addonapiv1beta1.ManagedClusterAddOn{}
+				if err := json.Unmarshal(patch, addOn); err != nil {
+					t.Fatal(err)
+				}
+				if !meta.IsStatusConditionFalse(
+					addOn.Status.Conditions,
+					addonapiv1beta1.ManagedClusterAddOnHookManifestCompleted,
+				) {
+					t.Error("expected legacy hook condition to be corrected to False")
+				}
+				if !meta.IsStatusConditionFalse(
+					addOn.Status.Conditions,
+					addonapiv1beta1.ManagedClusterAddOnPreDeleteHookCompleted,
+				) {
+					t.Error("expected pre-delete hook condition to be False")
+				}
+			},
+		},
 		{
 			name: "deploy hook manifest for a created addon, add finalizer",
 			key:  "cluster1/test",
@@ -101,6 +238,31 @@ func TestHostingHookReconcile(t *testing.T) {
 			}},
 			validateWorkActions: func(t *testing.T, actions []clienttesting.Action) {
 				addontesting.AssertActions(t, actions, "create")
+			},
+			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "patch")
+			},
+		},
+		{
+			name: "delete a leftover hook Work while the addon is active",
+			key:  "cluster1/test",
+			addon: []runtime.Object{
+				addontesting.SetAddonFinalizers(
+					addontesting.NewHostedModeAddon("test", "cluster1", "cluster2", registrationAppliedCondition),
+					addonapiv1beta1.AddonHostingPreDeleteHookFinalizer,
+					addonapiv1beta1.AddonHostingManifestFinalizer,
+				),
+			},
+			cluster: []runtime.Object{
+				addontesting.NewManagedCluster("cluster1"),
+				addontesting.NewManagedCluster("cluster2"),
+			},
+			testaddon: &testHostedAgent{name: "test", objects: []runtime.Object{
+				addontesting.NewHostedHookJob("test", "default"),
+			}},
+			existingWork: []runtime.Object{getHostedHookWork(true)},
+			validateWorkActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "delete", "list")
 			},
 			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
 				addontesting.AssertActions(t, actions, "patch")
@@ -214,7 +376,7 @@ func TestHostingHookReconcile(t *testing.T) {
 			},
 		},
 		{
-			name: "deploy hook manifest for a deleting addon with 2 finalizer, without completed condition",
+			name: "persist completed hook condition before removing its finalizer",
 			key:  "cluster1/test",
 			addon: []runtime.Object{
 				addontesting.SetAddonFinalizers(
@@ -302,20 +464,19 @@ func TestHostingHookReconcile(t *testing.T) {
 				addontesting.AssertActions(t, actions, "patch")
 				patch := actions[0].(clienttesting.PatchActionImpl).Patch
 				addOn := &addonapiv1beta1.ManagedClusterAddOn{}
-				err := json.Unmarshal(patch, addOn)
-				if err != nil {
+				if err := json.Unmarshal(patch, addOn); err != nil {
 					t.Fatal(err)
-				}
-				if addonHasFinalizer(addOn, addonapiv1beta1.AddonHostingPreDeleteHookFinalizer) {
-					t.Errorf("expected no HostingPreDeleteHookFinalizer on addon.")
 				}
 				if !meta.IsStatusConditionTrue(addOn.Status.Conditions, addonapiv1beta1.ManagedClusterAddOnHookManifestCompleted) {
 					t.Errorf("HookManifestCompleted condition should be true, but got false.")
 				}
+				if !meta.IsStatusConditionTrue(addOn.Status.Conditions, addonapiv1beta1.ManagedClusterAddOnPreDeleteHookCompleted) {
+					t.Errorf("PreDeleteHookCompleted condition should be true, but got false.")
+				}
 			},
 		},
 		{
-			name: "deploy hook manifest for a deleting addon with 1 finalizer, completed condition",
+			name: "persist hosting cleanup finalizer before trusting or creating hosted work",
 			key:  "cluster1/test",
 			addon: []runtime.Object{
 				addontesting.SetAddonFinalizers(
@@ -400,16 +561,17 @@ func TestHostingHookReconcile(t *testing.T) {
 				}(),
 			},
 			validateWorkActions: func(t *testing.T, actions []clienttesting.Action) {
-				// hosted sync deletes the hook work in the hosting cluster ns
-				addontesting.AssertActions(t, actions, "delete")
+				addontesting.AssertNoActions(t, actions)
 			},
 			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
-				// delete HostingPreDeleteHookFinalizer
 				addontesting.AssertActions(t, actions, "update")
 				actual := actions[0].(clienttesting.UpdateActionImpl).Object
 				addOn := actual.(*addonapiv1beta1.ManagedClusterAddOn)
-				if addonHasFinalizer(addOn, addonapiv1beta1.AddonHostingPreDeleteHookFinalizer) {
-					t.Errorf("expected no HostingPreDeleteHookFinalizer on addon.")
+				if !addonHasFinalizer(addOn, addonapiv1beta1.AddonHostingManifestFinalizer) {
+					t.Errorf("expected HostingManifestFinalizer on addon.")
+				}
+				if !addonHasFinalizer(addOn, addonapiv1beta1.AddonHostingPreDeleteHookFinalizer) {
+					t.Errorf("expected HostingPreDeleteHookFinalizer on addon.")
 				}
 			},
 		},
@@ -488,6 +650,7 @@ func TestHostingHookReconcile(t *testing.T) {
 					index.ManifestWorkByAddon:           index.IndexManifestWorkByAddon,
 					index.ManifestWorkByHostedAddon:     index.IndexManifestWorkByHostedAddon,
 					index.ManifestWorkHookByHostedAddon: index.IndexManifestWorkHookByHostedAddon,
+					index.ManifestWorkByAddonIdentity:   index.IndexManifestWorkByAddonIdentity,
 				},
 			)
 			if err != nil {
@@ -511,9 +674,11 @@ func TestHostingHookReconcile(t *testing.T) {
 			}
 
 			controller := addonDeployController{
+				workClient:                fakeWorkClient,
 				workApplier:               workapplier.NewWorkApplierWithTypedClient(fakeWorkClient, workInformerFactory.Work().V1().ManifestWorks().Lister()),
 				workBuilder:               workbuilder.NewWorkBuilder(),
 				addonClient:               fakeAddonClient,
+				clusterClient:             fakeClusterClient,
 				managedClusterLister:      clusterInformers.Cluster().V1().ManagedClusters().Lister(),
 				managedClusterAddonLister: addonInformers.Addon().V1beta1().ManagedClusterAddOns().Lister(),
 				workIndexer:               workInformerFactory.Work().V1().ManifestWorks().Informer().GetIndexer(),
@@ -531,5 +696,57 @@ func TestHostingHookReconcile(t *testing.T) {
 			c.validateAddonActions(t, fakeAddonClient.Actions())
 			c.validateWorkActions(t, fakeWorkClient.Actions())
 		})
+	}
+}
+
+func TestHostedHookCleanupUsesGeneralFinalizerForLiveBarrier(t *testing.T) {
+	addon := addontesting.SetAddonFinalizers(
+		addontesting.SetAddonDeletionTimestamp(
+			addontesting.NewHostedModeAddon("test", "cluster1", "cluster2", registrationAppliedCondition),
+			time.Now(),
+		),
+		addonapiv1beta1.AddonHostingManifestFinalizer,
+	)
+	work := getHostedHookWork(true)
+
+	syncer := &hostedHookSyncer{
+		buildWorks: func(
+			context.Context,
+			string,
+			*clusterv1.ManagedCluster,
+			*addonapiv1beta1.ManagedClusterAddOn,
+		) (*workapiv1.ManifestWork, error) {
+			return work, nil
+		},
+		deleteWork: func(context.Context, string, string) error {
+			return nil
+		},
+		getWorkByAddon: func(string, string) ([]*workapiv1.ManifestWork, error) {
+			// Simulate an informer cache that has not observed the hook Work.
+			return nil, nil
+		},
+		listWorkByAddon: func(context.Context, string, string) ([]*workapiv1.ManifestWork, error) {
+			// The live API still contains an undeleted hook Work.
+			return []*workapiv1.ManifestWork{work}, nil
+		},
+		getCluster: func(string) (*clusterv1.ManagedCluster, error) {
+			return addontesting.NewManagedCluster("cluster2"), nil
+		},
+		agentAddon: &testHostedAgent{name: "test", objects: []runtime.Object{
+			addontesting.NewHostedHookJob("test", "default"),
+		}},
+	}
+
+	updated, err := syncer.sync(
+		context.Background(),
+		addontesting.NewFakeSyncContext(t),
+		addontesting.NewManagedCluster("cluster1"),
+		addon,
+	)
+	if err == nil {
+		t.Fatal("expected live hook Work to block hosting finalizer removal")
+	}
+	if !addonHasFinalizer(updated, addonapiv1beta1.AddonHostingManifestFinalizer) {
+		t.Fatal("hosting cleanup finalizer was removed before live hook deletion became observable")
 	}
 }
