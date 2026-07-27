@@ -52,17 +52,22 @@ func (s *defaultSyncer) sync(ctx context.Context,
 	if err != nil {
 		return addon, err
 	}
+	currentWorks, staleWorks := partitionWorksForTarget(addon, deployWorkNamespace, currentWorks)
 
 	deployWorks, deleteWorks, err := s.buildWorks(ctx, deployWorkNamespace, cluster, currentWorks, addon)
 	if err != nil {
 		return addon, err
 	}
+	deleteWorks = append(staleWorks, deleteWorks...)
 
 	for _, deleteWork := range deleteWorks {
-		err = s.deleteWork(ctx, deployWorkNamespace, deleteWork.Name)
+		err = s.deleteWork(ctx, deleteWork.Namespace, deleteWork.Name)
 		if err != nil {
 			errs = append(errs, err)
 		}
+	}
+	if len(errs) != 0 {
+		return addon, utilerrors.NewAggregate(errs)
 	}
 
 	for _, deployWork := range deployWorks {

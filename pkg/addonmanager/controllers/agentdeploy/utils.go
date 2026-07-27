@@ -81,19 +81,121 @@ func addonAddFinalizer(addon *addonapiv1beta1.ManagedClusterAddOn, finalizer str
 	return true
 }
 
-func newManifestWork(addonNamespace, addonName, clusterName string, manifests []workapiv1.Manifest,
+func partitionWorksForTarget(
+	addon *addonapiv1beta1.ManagedClusterAddOn,
+	workNamespace string,
+	works []*workapiv1.ManifestWork,
+) (current, stale []*workapiv1.ManifestWork) {
+	for _, work := range works {
+		if managedBy, ok := work.Labels[constants.AddonFrameworkManagedByLabelKey]; ok &&
+			managedBy != constants.AddonFrameworkManagedByLabelValue {
+			continue
+		}
+
+		sourceUID := work.Labels[constants.AddonFrameworkSourceUIDLabelKey]
+		if work.Namespace != workNamespace || sourceUID != "" && sourceUID != string(addon.UID) {
+			stale = append(stale, work)
+			continue
+		}
+
+		current = append(current, work)
+	}
+
+	return current, stale
+}
+
+func ownedWorks(works []*workapiv1.ManifestWork) []*workapiv1.ManifestWork {
+	owned := make([]*workapiv1.ManifestWork, 0, len(works))
+	for _, work := range works {
+		if managedBy, ok := work.Labels[constants.AddonFrameworkManagedByLabelKey]; ok &&
+			managedBy != constants.AddonFrameworkManagedByLabelValue {
+			continue
+		}
+		owned = append(owned, work)
+	}
+	return owned
+}
+
+func verifyWorkDeletionStarted(works []*workapiv1.ManifestWork) error {
+	for _, work := range ownedWorks(works) {
+		if work.DeletionTimestamp.IsZero() {
+			return fmt.Errorf("ManifestWork %s/%s still exists without deletionTimestamp", work.Namespace, work.Name)
+		}
+	}
+	return nil
+}
+
+func setPreDeleteHookCondition(
+	addon *addonapiv1beta1.ManagedClusterAddOn,
+	status metav1.ConditionStatus,
+	reason, message string,
+) {
+	meta.SetStatusCondition(&addon.Status.Conditions, metav1.Condition{
+		Type:               addonapiv1beta1.ManagedClusterAddOnPreDeleteHookCompleted,
+		Status:             status,
+		ObservedGeneration: addon.Generation,
+		Reason:             reason,
+		Message:            message,
+	})
+
+	legacyReason := "HookManifestIsNotCompleted"
+	if status == metav1.ConditionTrue {
+		legacyReason = "HookManifestIsCompleted"
+	}
+	meta.SetStatusCondition(&addon.Status.Conditions, metav1.Condition{
+		Type:               addonapiv1beta1.ManagedClusterAddOnHookManifestCompleted,
+		Status:             status,
+		ObservedGeneration: addon.Generation,
+		Reason:             legacyReason,
+		Message:            message,
+	})
+}
+
+func normalizePreDeleteHookCondition(addon *addonapiv1beta1.ManagedClusterAddOn) {
+	if addon.DeletionTimestamp.IsZero() ||
+		(!addonHasFinalizer(addon, addonapiv1beta1.AddonPreDeleteHookFinalizer) &&
+			!addonHasFinalizer(addon, addonapiv1beta1.AddonHostingPreDeleteHookFinalizer)) {
+		return
+	}
+
+	condition := meta.FindStatusCondition(
+		addon.Status.Conditions,
+		addonapiv1beta1.ManagedClusterAddOnPreDeleteHookCompleted,
+	)
+	if condition == nil {
+		condition = meta.FindStatusCondition(
+			addon.Status.Conditions,
+			addonapiv1beta1.ManagedClusterAddOnHookManifestCompleted,
+		)
+	}
+	if condition == nil || condition.Status != metav1.ConditionTrue {
+		return
+	}
+
+	setPreDeleteHookCondition(
+		addon,
+		metav1.ConditionFalse,
+		addonapiv1beta1.PreDeleteHookReasonPending,
+		"waiting for all pre-delete hook ManifestWorks to complete",
+	)
+}
+
+func newManifestWork(addonNamespace, addonName, addonUID, clusterName string, manifests []workapiv1.Manifest,
 	manifestWorkNameFunc func(addonNamespace, addonName string) string) *workapiv1.ManifestWork {
 	if len(manifests) == 0 {
 		return nil
 	}
 
+	labels := map[string]string{
+		addonapiv1beta1.AddonLabelKey: addonName,
+	}
+	setAddonWorkOwnershipLabels(labels, addonNamespace, addonUID, clusterName)
+
 	work := &workapiv1.ManifestWork{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      manifestWorkNameFunc(addonNamespace, addonName),
 			Namespace: clusterName,
-			Labels: map[string]string{
-				addonapiv1beta1.AddonLabelKey: addonName,
-			},
+			Labels:    labels,
 		},
 		Spec: workapiv1.ManifestWorkSpec{
 			Workload: workapiv1.ManifestsTemplate{
@@ -102,10 +204,6 @@ func newManifestWork(addonNamespace, addonName, clusterName string, manifests []
 		},
 	}
 
-	// if the addon namespace is not equal with the manifestwork namespace(cluster name), add the addon namespace label
-	if addonNamespace != clusterName {
-		work.Labels[addonapiv1beta1.AddonNamespaceLabelKey] = addonNamespace
-	}
 	return work
 }
 
@@ -304,10 +402,6 @@ func (b *addonWorksBuilder) BuildDeployWorks(installMode, addonWorkNamespace str
 
 		deployObjects = append(deployObjects, object)
 	}
-	if len(deployObjects) == 0 {
-		return nil, nil, nil
-	}
-
 	var deletionOption *workapiv1.DeleteOption
 	if len(deletionOrphaningRules) != 0 {
 		deletionOption = &workapiv1.DeleteOption{
@@ -324,7 +418,14 @@ func (b *addonWorksBuilder) BuildDeployWorks(installMode, addonWorkNamespace str
 	}
 
 	return b.workBuilder.Build(deployObjects,
-		newAddonWorkObjectMeta(b.processor.manifestWorkNamePrefix(addon.Namespace, addon.Name), addon.Name, addon.Namespace, addonWorkNamespace, owner),
+		newAddonWorkObjectMeta(
+			b.processor.manifestWorkNamePrefix(addon.Namespace, addon.Name),
+			addon.Name,
+			addon.Namespace,
+			string(addon.UID),
+			addonWorkNamespace,
+			owner,
+		),
 		workbuilder.ExistingManifestWorksOption(existingWorks),
 		workbuilder.ManifestConfigOption(manifestOptions),
 		workbuilder.ManifestAnnotations(annotations),
@@ -370,16 +471,20 @@ func (b *addonWorksBuilder) BuildHookWork(installMode, addonWorkNamespace string
 		return nil, nil
 	}
 
-	hookWork = newManifestWork(addon.Namespace, addon.Name, addonWorkNamespace, hookManifests, b.processor.preDeleteHookManifestWorkName)
+	hookWork = newManifestWork(
+		addon.Namespace,
+		addon.Name,
+		string(addon.UID),
+		addonWorkNamespace,
+		hookManifests,
+		b.processor.preDeleteHookManifestWorkName,
+	)
 
 	// This owner is only added to the manifestWork deployed in managed cluster ns.
 	if addon.Namespace == addonWorkNamespace {
 		hookWork.OwnerReferences = []metav1.OwnerReference{*owner}
 	}
 	hookWork.Spec.ManifestConfigs = hookManifestConfigs
-	if addon.Namespace != addonWorkNamespace {
-		hookWork.Labels[addonapiv1beta1.AddonNamespaceLabelKey] = addon.Namespace
-	}
 	return hookWork, nil
 }
 
@@ -457,15 +562,18 @@ func hookWorkIsCompleted(hookWork *workapiv1.ManifestWork) bool {
 	return true
 }
 
-func newAddonWorkObjectMeta(namePrefix, addonName, addonNamespace, workNamespace string,
+func newAddonWorkObjectMeta(namePrefix, addonName, addonNamespace, addonUID, workNamespace string,
 	owner *metav1.OwnerReference) workbuilder.GenerateManifestWorkObjectMeta {
 	return func(index int) metav1.ObjectMeta {
+		labels := map[string]string{
+			addonapiv1beta1.AddonLabelKey: addonName,
+		}
+		setAddonWorkOwnershipLabels(labels, addonNamespace, addonUID, workNamespace)
+
 		objectMeta := metav1.ObjectMeta{
 			Name:      fmt.Sprintf("%s-%d", namePrefix, index),
 			Namespace: workNamespace,
-			Labels: map[string]string{
-				addonapiv1beta1.AddonLabelKey: addonName,
-			},
+			Labels:    labels,
 		}
 		// This owner is only added to the manifestWork deployed in managed cluster ns.
 		// the manifestWork in managed cluster ns is cleaned up via the addon ownerRef, so need to add the owner.
@@ -473,11 +581,21 @@ func newAddonWorkObjectMeta(namePrefix, addonName, addonNamespace, workNamespace
 		if addonNamespace == workNamespace && owner != nil {
 			objectMeta.OwnerReferences = []metav1.OwnerReference{*owner}
 		}
-		// if the addon namespace is not equal with the manifestwork namespace(cluster name), add the addon namespace label
-		if addonNamespace != workNamespace {
-			objectMeta.Labels[addonapiv1beta1.AddonNamespaceLabelKey] = addonNamespace
-		}
 		return objectMeta
+	}
+}
+
+func setAddonWorkOwnershipLabels(labels map[string]string, addonNamespace, addonUID, workNamespace string) {
+	if addonUID != "" {
+		labels[addonapiv1beta1.AddonNamespaceLabelKey] = addonNamespace
+		labels[constants.AddonFrameworkManagedByLabelKey] = constants.AddonFrameworkManagedByLabelValue
+		labels[constants.AddonFrameworkSourceUIDLabelKey] = addonUID
+		return
+	}
+
+	// Preserve the legacy shape for synthetic objects without an API-server-assigned UID.
+	if addonNamespace != workNamespace {
+		labels[addonapiv1beta1.AddonNamespaceLabelKey] = addonNamespace
 	}
 }
 

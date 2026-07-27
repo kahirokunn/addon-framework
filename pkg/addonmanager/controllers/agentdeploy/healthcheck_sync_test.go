@@ -1338,6 +1338,7 @@ func TestHealthCheckReconcile(t *testing.T) {
 					index.ManifestWorkByAddon:           index.IndexManifestWorkByAddon,
 					index.ManifestWorkByHostedAddon:     index.IndexManifestWorkByHostedAddon,
 					index.ManifestWorkHookByHostedAddon: index.IndexManifestWorkHookByHostedAddon,
+					index.ManifestWorkByAddonIdentity:   index.IndexManifestWorkByAddonIdentity,
 				},
 			)
 

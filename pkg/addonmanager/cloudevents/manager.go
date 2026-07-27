@@ -153,6 +153,7 @@ func (a *cloudeventsAddonManager) Start(ctx context.Context) error {
 			index.ManifestWorkByAddon:           index.IndexManifestWorkByAddon,
 			index.ManifestWorkByHostedAddon:     index.IndexManifestWorkByHostedAddon,
 			index.ManifestWorkHookByHostedAddon: index.IndexManifestWorkHookByHostedAddon,
+			index.ManifestWorkByAddonIdentity:   index.IndexManifestWorkByAddonIdentity,
 		},
 	)
 	if err != nil {

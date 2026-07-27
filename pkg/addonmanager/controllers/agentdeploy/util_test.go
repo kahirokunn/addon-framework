@@ -4,8 +4,10 @@ import (
 	"context"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -14,9 +16,91 @@ import (
 	workapiv1 "open-cluster-management.io/api/work/v1"
 
 	"open-cluster-management.io/addon-framework/pkg/addonmanager/addontesting"
+	"open-cluster-management.io/addon-framework/pkg/addonmanager/constants"
 	"open-cluster-management.io/addon-framework/pkg/agent"
 	"open-cluster-management.io/addon-framework/pkg/utils"
 )
+
+func TestAddonWorkOwnership(t *testing.T) {
+	labels := map[string]string{
+		addonapiv1beta1.AddonLabelKey: "test",
+	}
+	setAddonWorkOwnershipLabels(labels, "cluster1", "uid-current", "cluster2")
+
+	assert.Equal(t, "cluster1", labels[addonapiv1beta1.AddonNamespaceLabelKey])
+	assert.Equal(t, constants.AddonFrameworkManagedByLabelValue, labels[constants.AddonFrameworkManagedByLabelKey])
+	assert.Equal(t, "uid-current", labels[constants.AddonFrameworkSourceUIDLabelKey])
+
+	addon := &addonapiv1beta1.ManagedClusterAddOn{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "cluster1",
+			Name:      "test",
+			UID:       types.UID("uid-current"),
+		},
+	}
+	currentWork := &workapiv1.ManifestWork{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "cluster2",
+		Labels: map[string]string{
+			constants.AddonFrameworkManagedByLabelKey: constants.AddonFrameworkManagedByLabelValue,
+			constants.AddonFrameworkSourceUIDLabelKey: "uid-current",
+		},
+	}}
+	staleWork := currentWork.DeepCopy()
+	staleWork.Labels[constants.AddonFrameworkSourceUIDLabelKey] = "uid-old"
+
+	current, stale := partitionWorksForTarget(addon, "cluster2", []*workapiv1.ManifestWork{currentWork, staleWork})
+	assert.Equal(t, []*workapiv1.ManifestWork{currentWork}, current)
+	assert.Equal(t, []*workapiv1.ManifestWork{staleWork}, stale)
+}
+
+func TestNormalizePreDeleteHookCondition(t *testing.T) {
+	addon := addontesting.SetAddonFinalizers(
+		addontesting.SetAddonDeletionTimestamp(
+			addontesting.NewAddon("test", "cluster1"),
+			time.Now(),
+		),
+		addonapiv1beta1.AddonPreDeleteHookFinalizer,
+		addonapiv1beta1.AddonHostingPreDeleteHookFinalizer,
+	)
+	setPreDeleteHookCondition(
+		addon,
+		metav1.ConditionTrue,
+		addonapiv1beta1.PreDeleteHookReasonCompleted,
+		"one target completed",
+	)
+
+	addonRemoveFinalizer(addon, addonapiv1beta1.AddonPreDeleteHookFinalizer)
+	normalizePreDeleteHookCondition(addon)
+
+	if !meta.IsStatusConditionFalse(
+		addon.Status.Conditions,
+		addonapiv1beta1.ManagedClusterAddOnPreDeleteHookCompleted,
+	) {
+		t.Fatal("expected aggregate hook condition to remain False while a hook finalizer remains")
+	}
+	if !meta.IsStatusConditionFalse(
+		addon.Status.Conditions,
+		addonapiv1beta1.ManagedClusterAddOnHookManifestCompleted,
+	) {
+		t.Fatal("expected legacy aggregate hook condition to remain False while a hook finalizer remains")
+	}
+
+	addonRemoveFinalizer(addon, addonapiv1beta1.AddonHostingPreDeleteHookFinalizer)
+	setPreDeleteHookCondition(
+		addon,
+		metav1.ConditionTrue,
+		addonapiv1beta1.PreDeleteHookReasonCompleted,
+		"all targets completed",
+	)
+	normalizePreDeleteHookCondition(addon)
+
+	if !meta.IsStatusConditionTrue(
+		addon.Status.Conditions,
+		addonapiv1beta1.ManagedClusterAddOnPreDeleteHookCompleted,
+	) {
+		t.Fatal("expected aggregate hook condition to become True after all hook finalizers are removed")
+	}
+}
 
 func TestConfigsToAnnotations(t *testing.T) {
 	cases := []struct {

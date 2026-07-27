@@ -294,17 +294,23 @@ func TestDefaultHookReconcile(t *testing.T) {
 			},
 			validateWorkActions: addontesting.AssertNoActions,
 			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
-				// delete finalizer, patch completed condition.
-				addontesting.AssertActions(t, actions, "update")
-				actual := actions[0].(clienttesting.UpdateActionImpl).Object
-				addOn := actual.(*addonapiv1beta1.ManagedClusterAddOn)
-				if addonHasFinalizer(addOn, addonapiv1beta1.AddonPreDeleteHookFinalizer) {
-					t.Errorf("expected no pre delete hook finalizer on managedCluster.")
+				// Persist completion through the status subresource before deleting the finalizer.
+				addontesting.AssertActions(t, actions, "patch")
+				patch := actions[0].(clienttesting.PatchActionImpl).Patch
+				addOn := &addonapiv1beta1.ManagedClusterAddOn{}
+				if err := json.Unmarshal(patch, addOn); err != nil {
+					t.Fatal(err)
+				}
+				if !meta.IsStatusConditionTrue(
+					addOn.Status.Conditions,
+					addonapiv1beta1.ManagedClusterAddOnPreDeleteHookCompleted,
+				) {
+					t.Error("expected pre-delete hook completion to be persisted first")
 				}
 			},
 		},
 		{
-			name: "deploy hook manifest for a deleting addon without finalizer, completed",
+			name: "do not recreate hook for a deleting addon without finalizer",
 			key:  "cluster1/test",
 			addon: []runtime.Object{
 				addontesting.SetAddonDeletionTimestamp(
@@ -373,11 +379,8 @@ func TestDefaultHookReconcile(t *testing.T) {
 					return work
 				}(),
 			},
-			validateWorkActions: addontesting.AssertNoActions,
-			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
-				// add finalizer
-				addontesting.AssertActions(t, actions, "update")
-			},
+			validateWorkActions:  addontesting.AssertNoActions,
+			validateAddonActions: addontesting.AssertNoActions,
 		},
 		{
 			name:    "deploy hook manifest when ConfigCheckEnabled is true",
@@ -433,6 +436,7 @@ func TestDefaultHookReconcile(t *testing.T) {
 					index.ManifestWorkByAddon:           index.IndexManifestWorkByAddon,
 					index.ManifestWorkByHostedAddon:     index.IndexManifestWorkByHostedAddon,
 					index.ManifestWorkHookByHostedAddon: index.IndexManifestWorkHookByHostedAddon,
+					index.ManifestWorkByAddonIdentity:   index.IndexManifestWorkByAddonIdentity,
 				},
 			)
 
@@ -457,9 +461,11 @@ func TestDefaultHookReconcile(t *testing.T) {
 			}
 
 			controller := addonDeployController{
+				workClient:                fakeWorkClient,
 				workApplier:               workapplier.NewWorkApplierWithTypedClient(fakeWorkClient, workInformerFactory.Work().V1().ManifestWorks().Lister()),
 				workBuilder:               workbuilder.NewWorkBuilder(),
 				addonClient:               fakeAddonClient,
+				clusterClient:             fakeClusterClient,
 				managedClusterLister:      clusterInformers.Cluster().V1().ManagedClusters().Lister(),
 				managedClusterAddonLister: addonInformers.Addon().V1beta1().ManagedClusterAddOns().Lister(),
 				workIndexer:               workInformerFactory.Work().V1().ManifestWorks().Informer().GetIndexer(),

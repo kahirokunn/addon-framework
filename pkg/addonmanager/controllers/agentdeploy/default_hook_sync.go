@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	addonapiv1beta1 "open-cluster-management.io/api/addon/v1beta1"
@@ -38,11 +37,14 @@ func (s *defaultHookSyncer) sync(ctx context.Context,
 		return addon, nil
 	}
 
-	if addonAddFinalizer(addon, addonapiv1beta1.AddonPreDeleteHookFinalizer) {
+	if addon.DeletionTimestamp.IsZero() {
+		addonAddFinalizer(addon, addonapiv1beta1.AddonPreDeleteHookFinalizer)
 		return addon, nil
 	}
 
-	if addon.DeletionTimestamp.IsZero() {
+	// A missing finalizer on a deleting addon means hook execution has already advanced or was never protected.
+	// Never recreate a hook in this phase.
+	if !addonHasFinalizer(addon, addonapiv1beta1.AddonPreDeleteHookFinalizer) {
 		return addon, nil
 	}
 
@@ -52,25 +54,24 @@ func (s *defaultHookSyncer) sync(ctx context.Context,
 		return addon, err
 	}
 
-	// TODO: will surface more message here
 	if hookWorkIsCompleted(hookWork) {
-		meta.SetStatusCondition(&addon.Status.Conditions, metav1.Condition{
-			Type:    addonapiv1beta1.ManagedClusterAddOnHookManifestCompleted,
-			Status:  metav1.ConditionTrue,
-			Reason:  "HookManifestIsCompleted",
-			Message: fmt.Sprintf("hook manifestWork %v is completed.", hookWork.Name),
-		})
+		setPreDeleteHookCondition(
+			addon,
+			metav1.ConditionTrue,
+			addonapiv1beta1.PreDeleteHookReasonCompleted,
+			fmt.Sprintf("pre-delete hook ManifestWork %s/%s is completed", hookWork.Namespace, hookWork.Name),
+		)
 
 		addonRemoveFinalizer(addon, addonapiv1beta1.AddonPreDeleteHookFinalizer)
 		return addon, nil
 	}
 
-	meta.SetStatusCondition(&addon.Status.Conditions, metav1.Condition{
-		Type:    addonapiv1beta1.ManagedClusterAddOnHookManifestCompleted,
-		Status:  metav1.ConditionFalse,
-		Reason:  "HookManifestIsNotCompleted",
-		Message: fmt.Sprintf("hook manifestWork %v is not completed.", hookWork.Name),
-	})
+	setPreDeleteHookCondition(
+		addon,
+		metav1.ConditionFalse,
+		addonapiv1beta1.PreDeleteHookReasonPending,
+		fmt.Sprintf("pre-delete hook ManifestWork %s/%s is not completed", hookWork.Namespace, hookWork.Name),
+	)
 
 	return addon, nil
 }

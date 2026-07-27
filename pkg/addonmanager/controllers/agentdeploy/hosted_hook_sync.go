@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 
@@ -28,6 +27,8 @@ type hostedHookSyncer struct {
 
 	getWorkByAddon func(addonName, addonNamespace string) ([]*workapiv1.ManifestWork, error)
 
+	listWorkByAddon listWorksByAddonFunc
+
 	getCluster func(clusterName string) (*clusterv1.ManagedCluster, error)
 
 	agentAddon agent.AgentAddon
@@ -38,16 +39,22 @@ func (s *hostedHookSyncer) sync(ctx context.Context,
 	cluster *clusterv1.ManagedCluster,
 	addon *addonapiv1beta1.ManagedClusterAddOn) (*addonapiv1beta1.ManagedClusterAddOn, error) {
 
-	// Hosted mode is not enabled, will not deploy any resource on the hosting cluster
-	if !s.agentAddon.GetAgentAddonOptions().HostedModeEnabled {
+	options := s.agentAddon.GetAgentAddonOptions()
+	if !options.HostedModeEnabled || options.HostedModeInfoFunc == nil {
+		if err := s.cleanupHookWork(ctx, addon); err != nil {
+			return addon, err
+		}
+		addonRemoveFinalizer(addon, addonapiv1beta1.AddonHostingPreDeleteHookFinalizer)
+		addonRemoveFinalizer(addon, addonapiv1beta1.AddonHostingManifestFinalizer)
 		return addon, nil
 	}
-
-	if s.agentAddon.GetAgentAddonOptions().HostedModeInfoFunc == nil {
-		return addon, nil
-	}
-	installMode, hostingClusterName := s.agentAddon.GetAgentAddonOptions().HostedModeInfoFunc(addon, cluster)
+	installMode, hostingClusterName := options.HostedModeInfoFunc(addon, cluster)
 	if installMode != constants.InstallModeHosted {
+		if err := s.cleanupHookWork(ctx, addon); err != nil {
+			return addon, err
+		}
+		addonRemoveFinalizer(addon, addonapiv1beta1.AddonHostingPreDeleteHookFinalizer)
+		addonRemoveFinalizer(addon, addonapiv1beta1.AddonHostingManifestFinalizer)
 		return addon, nil
 	}
 
@@ -58,8 +65,8 @@ func (s *hostedHookSyncer) sync(ctx context.Context,
 		if err = s.cleanupHookWork(ctx, addon); err != nil {
 			return addon, err
 		}
-
 		addonRemoveFinalizer(addon, addonapiv1beta1.AddonHostingPreDeleteHookFinalizer)
+		addonRemoveFinalizer(addon, addonapiv1beta1.AddonHostingManifestFinalizer)
 		return addon, nil
 	}
 	if err != nil {
@@ -71,6 +78,7 @@ func (s *hostedHookSyncer) sync(ctx context.Context,
 			return addon, err
 		}
 		addonRemoveFinalizer(addon, addonapiv1beta1.AddonHostingPreDeleteHookFinalizer)
+		addonRemoveFinalizer(addon, addonapiv1beta1.AddonHostingManifestFinalizer)
 		return addon, nil
 	}
 	hookWork, err := s.buildWorks(ctx, hostingClusterName, cluster, addon)
@@ -79,54 +87,84 @@ func (s *hostedHookSyncer) sync(ctx context.Context,
 	}
 
 	if hookWork == nil {
+		hadHookFinalizer := addonHasFinalizer(addon, addonapiv1beta1.AddonHostingPreDeleteHookFinalizer)
+		if addon.DeletionTimestamp.IsZero() {
+			if err = s.cleanupUnexpectedHookWork(ctx, addon); err != nil {
+				return addon, err
+			}
+		} else {
+			if err = s.cleanupHookWork(ctx, addon); err != nil {
+				return addon, err
+			}
+		}
 		addonRemoveFinalizer(addon, addonapiv1beta1.AddonHostingPreDeleteHookFinalizer)
+		if !addon.DeletionTimestamp.IsZero() && !hadHookFinalizer {
+			addonRemoveFinalizer(addon, addonapiv1beta1.AddonHostingManifestFinalizer)
+		}
 		return addon, nil
 	}
 
 	if addon.DeletionTimestamp.IsZero() {
-		addonAddFinalizer(addon, addonapiv1beta1.AddonHostingPreDeleteHookFinalizer)
+		finalizerChanged := addonAddFinalizer(addon, addonapiv1beta1.AddonHostingManifestFinalizer)
+		finalizerChanged = addonAddFinalizer(
+			addon,
+			addonapiv1beta1.AddonHostingPreDeleteHookFinalizer,
+		) || finalizerChanged
+		if finalizerChanged {
+			return addon, nil
+		}
+
+		// A hook Work is only desired while the addon is deleting. Remove leftovers from
+		// a previous ManagedClusterAddOn instance after its cleanup finalizers are durable.
+		if err = s.cleanupUnexpectedHookWork(ctx, addon); err != nil {
+			return addon, err
+		}
 		return addon, nil
 	}
 
 	if !addonHasFinalizer(addon, addonapiv1beta1.AddonHostingPreDeleteHookFinalizer) {
-		return addon, nil
-	}
-
-	// apply the pre-delete hook manifestWork when the addon is deleting and HookManifestCompleted condition is not true.
-	// there are 2 cases:
-	// 1. the HookManifestCompleted condition is false.
-	// 2. there is no this condition.
-	if !meta.IsStatusConditionTrue(addon.Status.Conditions, addonapiv1beta1.ManagedClusterAddOnHookManifestCompleted) {
-		hookWork, err = s.applyWork(ctx, addonapiv1beta1.ManagedClusterAddOnHostingManifestApplied, hookWork, addon)
-		if err != nil {
-			return addon, err
-		}
-	} else {
-		// cleanup is safe here since there is no case which HookManifestCompleted condition is changed from true to false.
 		if err = s.cleanupHookWork(ctx, addon); err != nil {
 			return addon, err
 		}
-		if addonRemoveFinalizer(addon, addonapiv1beta1.AddonHostingPreDeleteHookFinalizer) {
-			return addon, err
+		if !addon.DeletionTimestamp.IsZero() {
+			addonRemoveFinalizer(addon, addonapiv1beta1.AddonHostingManifestFinalizer)
 		}
 		return addon, nil
 	}
 
-	// TODO: will surface more message here
+	currentWorks, err := s.getWorkByAddon(addon.Name, addon.Namespace)
+	if err != nil {
+		return addon, err
+	}
+	_, staleWorks := partitionWorksForTarget(addon, hostingClusterName, currentWorks)
+	for _, staleWork := range staleWorks {
+		if err = s.deleteWork(ctx, staleWork.Namespace, staleWork.Name); err != nil {
+			return addon, err
+		}
+	}
+
+	hookWork, err = s.applyWork(ctx, addonapiv1beta1.ManagedClusterAddOnHostingManifestApplied, hookWork, addon)
+	if err != nil {
+		return addon, err
+	}
+
 	if hookWorkIsCompleted(hookWork) {
-		meta.SetStatusCondition(&addon.Status.Conditions, metav1.Condition{
-			Type:    addonapiv1beta1.ManagedClusterAddOnHookManifestCompleted,
-			Status:  metav1.ConditionTrue,
-			Reason:  "HookManifestIsCompleted",
-			Message: fmt.Sprintf("hook manifestWork %v is completed.", hookWork.Name),
-		})
+		setPreDeleteHookCondition(
+			addon,
+			metav1.ConditionTrue,
+			addonapiv1beta1.PreDeleteHookReasonCompleted,
+			fmt.Sprintf("pre-delete hook ManifestWork %s/%s is completed", hookWork.Namespace, hookWork.Name),
+		)
+		// The completed Work remains as durable evidence until this finalizer removal is persisted.
+		// The hosting cleanup finalizer protects the subsequent Work deletion phase.
+		addonRemoveFinalizer(addon, addonapiv1beta1.AddonHostingPreDeleteHookFinalizer)
 	} else {
-		meta.SetStatusCondition(&addon.Status.Conditions, metav1.Condition{
-			Type:    addonapiv1beta1.ManagedClusterAddOnHookManifestCompleted,
-			Status:  metav1.ConditionFalse,
-			Reason:  "HookManifestIsNotCompleted",
-			Message: fmt.Sprintf("hook manifestWork %v is not completed.", hookWork.Name),
-		})
+		setPreDeleteHookCondition(
+			addon,
+			metav1.ConditionFalse,
+			addonapiv1beta1.PreDeleteHookReasonPending,
+			fmt.Sprintf("pre-delete hook ManifestWork %s/%s is not completed", hookWork.Namespace, hookWork.Name),
+		)
 	}
 
 	return addon, nil
@@ -136,22 +174,55 @@ func (s *hostedHookSyncer) sync(ctx context.Context,
 // if the hostingClusterName is empty, will try to find out the hosting cluster by manifestWork labels and do the cleanup
 func (s *hostedHookSyncer) cleanupHookWork(ctx context.Context,
 	addon *addonapiv1beta1.ManagedClusterAddOn) (err error) {
-	if !addonHasFinalizer(addon, addonapiv1beta1.AddonHostingPreDeleteHookFinalizer) {
-		return nil
-	}
-
 	currentWorks, err := s.getWorkByAddon(addon.Name, addon.Namespace)
 	if err != nil {
 		return err
 	}
+	currentWorks = ownedWorks(currentWorks)
+	if len(currentWorks) == 0 &&
+		!addonHasFinalizer(addon, addonapiv1beta1.AddonHostingPreDeleteHookFinalizer) &&
+		!addonHasFinalizer(addon, addonapiv1beta1.AddonHostingManifestFinalizer) {
+		return nil
+	}
 
+	return s.deleteHookWorks(ctx, addon, currentWorks)
+}
+
+func (s *hostedHookSyncer) cleanupUnexpectedHookWork(
+	ctx context.Context,
+	addon *addonapiv1beta1.ManagedClusterAddOn,
+) error {
+	currentWorks, err := s.getWorkByAddon(addon.Name, addon.Namespace)
+	if err != nil {
+		return err
+	}
+	currentWorks = ownedWorks(currentWorks)
+	if len(currentWorks) == 0 {
+		return nil
+	}
+
+	return s.deleteHookWorks(ctx, addon, currentWorks)
+}
+
+func (s *hostedHookSyncer) deleteHookWorks(
+	ctx context.Context,
+	addon *addonapiv1beta1.ManagedClusterAddOn,
+	currentWorks []*workapiv1.ManifestWork,
+) error {
 	var errs []error
 	for _, work := range currentWorks {
-		err = s.deleteWork(ctx, work.Namespace, work.Name)
+		err := s.deleteWork(ctx, work.Namespace, work.Name)
 		if err != nil {
 			errs = append(errs, err)
 		}
 	}
+	if aggregate := utilerrors.NewAggregate(errs); aggregate != nil {
+		return aggregate
+	}
 
-	return utilerrors.NewAggregate(errs)
+	liveWorks, err := s.listWorkByAddon(ctx, addon.Name, addon.Namespace)
+	if err != nil {
+		return err
+	}
+	return verifyWorkDeletionStarted(liveWorks)
 }
