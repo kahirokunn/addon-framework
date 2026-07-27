@@ -55,6 +55,7 @@ func (t *healthCheckTestAgent) GetAgentAddonOptions() agent.AgentAddonOptions {
 	return agent.AgentAddonOptions{
 		AddonName:          t.name,
 		HealthProber:       t.health,
+		HostedModeEnabled:  true,
 		HostedModeInfoFunc: constants.GetHostedModeInfo,
 	}
 }

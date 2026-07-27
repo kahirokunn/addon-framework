@@ -144,7 +144,7 @@ func (a *TemplateAgentAddon) getBuiltinValues(
 	}
 	builtinValues.AddonInstallNamespace = installNamespace
 
-	builtinValues.InstallMode, _ = a.agentAddonOptions.HostedModeInfoFunc(addon, cluster)
+	builtinValues.InstallMode, _ = a.agentAddonOptions.InstallMode(addon, cluster)
 
 	return StructToValues(builtinValues), nil
 }

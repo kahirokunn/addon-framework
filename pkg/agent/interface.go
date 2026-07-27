@@ -11,6 +11,8 @@ import (
 	addonapiv1beta1 "open-cluster-management.io/api/addon/v1beta1"
 	clusterv1 "open-cluster-management.io/api/cluster/v1"
 	workapiv1 "open-cluster-management.io/api/work/v1"
+
+	"open-cluster-management.io/addon-framework/pkg/addonmanager/constants"
 )
 
 // SubjectNotReadyError indicates that the registration subject is not yet set.
@@ -111,6 +113,17 @@ type AgentAddonOptions struct {
 	// If not set, will be defaulted to false.
 	// +optional
 	ConfigCheckEnabled bool
+}
+
+// InstallMode returns the install mode of the addon agent and its hosting cluster. the hosted mode
+// only applies when it is enabled for the addon.
+func (o AgentAddonOptions) InstallMode(addon *addonapiv1beta1.ManagedClusterAddOn,
+	cluster *clusterv1.ManagedCluster) (string, string) {
+	if !o.HostedModeEnabled || o.HostedModeInfoFunc == nil {
+		return constants.InstallModeDefault, ""
+	}
+
+	return o.HostedModeInfoFunc(addon, cluster)
 }
 
 type RegistrationConfigurationsFunc func(ctx context.Context, cluster *clusterv1.ManagedCluster,
