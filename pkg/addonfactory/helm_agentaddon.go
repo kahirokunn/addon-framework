@@ -256,7 +256,7 @@ func (a *HelmAgentAddon) getBuiltinValues(
 	}
 	builtinValues.AddonInstallNamespace = addonInstallNamespace
 
-	builtinValues.InstallMode, _ = a.agentAddonOptions.HostedModeInfoFunc(addon, cluster)
+	builtinValues.InstallMode, _ = a.agentAddonOptions.InstallMode(addon, cluster)
 
 	helmBuiltinValues, err := JsonStructToValues(builtinValues)
 	if err != nil {
@@ -278,7 +278,7 @@ func (a *HelmAgentAddon) getDefaultValues(
 
 	defaultValues.ManagedKubeConfigSecret = fmt.Sprintf("%s-managed-kubeconfig", addon.Name)
 	if a.clusterClient != nil {
-		_, hostingClusterName := a.agentAddonOptions.HostedModeInfoFunc(addon, cluster)
+		_, hostingClusterName := a.agentAddonOptions.InstallMode(addon, cluster)
 		if len(hostingClusterName) > 0 {
 			hostingCluster, err := a.clusterClient.ClusterV1().ManagedClusters().
 				Get(context.TODO(), hostingClusterName, metav1.GetOptions{})

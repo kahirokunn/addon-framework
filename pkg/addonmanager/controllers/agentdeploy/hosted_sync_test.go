@@ -34,6 +34,7 @@ type testHostedAgent struct {
 	objects            []runtime.Object
 	err                error
 	ConfigCheckEnabled bool
+	hostedModeDisabled bool
 }
 
 func (t *testHostedAgent) Manifests(ctx context.Context, cluster *clusterv1.ManagedCluster, addon *addonapiv1beta1.ManagedClusterAddOn) (
@@ -44,7 +45,7 @@ func (t *testHostedAgent) Manifests(ctx context.Context, cluster *clusterv1.Mana
 func (t *testHostedAgent) GetAgentAddonOptions() agent.AgentAddonOptions {
 	return agent.AgentAddonOptions{
 		AddonName:          t.name,
-		HostedModeEnabled:  true,
+		HostedModeEnabled:  !t.hostedModeDisabled,
 		HostedModeInfoFunc: constants.GetHostedModeInfo,
 		ConfigCheckEnabled: t.ConfigCheckEnabled,
 	}
@@ -58,6 +59,8 @@ func TestHostingReconcile(t *testing.T) {
 		addon                []runtime.Object
 		testaddon            *testHostedAgent
 		cluster              []runtime.Object
+		liveCluster          []runtime.Object
+		blockWorkDeletion    bool
 		validateAddonActions func(t *testing.T, actions []clienttesting.Action)
 		validateWorkActions  func(t *testing.T, actions []clienttesting.Action)
 	}{
@@ -66,10 +69,13 @@ func TestHostingReconcile(t *testing.T) {
 			key:  "cluster1/test",
 			addon: []runtime.Object{addontesting.NewHostedModeAddon("test", "cluster1", "cluster2",
 				registrationAppliedCondition)},
-			cluster:              []runtime.Object{},
-			existingWork:         []runtime.Object{},
-			validateAddonActions: addontesting.AssertNoActions,
-			validateWorkActions:  addontesting.AssertNoActions,
+			cluster:      []runtime.Object{},
+			existingWork: []runtime.Object{},
+			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "patch")
+				assertSourceClusterBlocked(t, actions[0])
+			},
+			validateWorkActions: addontesting.AssertNoActions,
 			testaddon: &testHostedAgent{name: "test", objects: []runtime.Object{
 				addontesting.NewUnstructured("v1", "ConfigMap", "default", "test"),
 			}},
@@ -79,13 +85,79 @@ func TestHostingReconcile(t *testing.T) {
 			key:  "cluster1/test",
 			addon: []runtime.Object{addontesting.NewHostedModeAddon("test", "cluster1", "cluster2",
 				registrationAppliedCondition)},
-			cluster:              []runtime.Object{addontesting.NewManagedCluster("cluster2")},
-			existingWork:         []runtime.Object{},
-			validateAddonActions: addontesting.AssertNoActions,
-			validateWorkActions:  addontesting.AssertNoActions,
+			cluster:      []runtime.Object{addontesting.NewManagedCluster("cluster2")},
+			existingWork: []runtime.Object{},
+			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "patch")
+				assertSourceClusterBlocked(t, actions[0])
+			},
+			validateWorkActions: addontesting.AssertNoActions,
 			testaddon: &testHostedAgent{name: "test", objects: []runtime.Object{
 				addontesting.NewUnstructured("v1", "ConfigMap", "default", "test"),
 			}},
+		},
+		{
+			name: "do not clean up when only the cluster informer is stale",
+			key:  "cluster1/test",
+			addon: []runtime.Object{addontesting.NewHostedModeAddon(
+				"test", "cluster1", "cluster2", registrationAppliedCondition,
+			)},
+			cluster:              []runtime.Object{},
+			liveCluster:          []runtime.Object{addontesting.NewManagedCluster("cluster1")},
+			existingWork:         []runtime.Object{getHostedDeployWork()},
+			validateAddonActions: addontesting.AssertNoActions,
+			validateWorkActions:  addontesting.AssertNoActions,
+			testaddon:            &testHostedAgent{name: "test"},
+		},
+		{
+			name: "use a live hosting cluster when only its informer is stale",
+			key:  "cluster1/test",
+			addon: []runtime.Object{addontesting.NewHostedModeAddonWithFinalizer(
+				"test", "cluster1", "cluster2", registrationAppliedCondition,
+			)},
+			cluster: []runtime.Object{
+				addontesting.NewManagedCluster("cluster1"),
+			},
+			liveCluster: []runtime.Object{
+				addontesting.NewManagedCluster("cluster1"),
+				addontesting.NewManagedCluster("cluster2"),
+			},
+			existingWork: []runtime.Object{getHostedDeployWork()},
+			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "patch")
+				assertHostingClusterValid(t, actions[0])
+			},
+			validateWorkActions: addontesting.AssertNoActions,
+			testaddon: &testHostedAgent{name: "test", objects: []runtime.Object{
+				addontesting.NewHostingUnstructured("v1", "ConfigMap", "default", "test"),
+			}},
+		},
+		{
+			name: "clear the source cluster blocked condition after the cluster returns",
+			key:  "cluster1/test",
+			addon: []runtime.Object{addontesting.NewHostedModeAddonWithFinalizer(
+				"test",
+				"cluster1",
+				"cluster2",
+				registrationAppliedCondition,
+				metav1.Condition{
+					Type:               addonapiv1beta1.ManagedClusterAddOnConditionAvailable,
+					Status:             metav1.ConditionUnknown,
+					ObservedGeneration: 0,
+					Reason:             managedClusterNotFoundReason,
+					Message:            "source managed cluster cluster1 is not found",
+				},
+			)},
+			cluster: []runtime.Object{
+				addontesting.NewManagedCluster("cluster1"),
+				addontesting.NewManagedCluster("cluster2"),
+			},
+			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "patch")
+				assertSourceClusterUnblocked(t, actions[0])
+			},
+			validateWorkActions: addontesting.AssertNoActions,
+			testaddon:           &testHostedAgent{name: "test"},
 		},
 		{
 			name: "no hosting cluster",
@@ -125,6 +197,63 @@ func TestHostingReconcile(t *testing.T) {
 			}},
 		},
 		{
+			name: "keep the hosting cleanup finalizer until the work deletion is observable",
+			key:  "cluster1/test",
+			addon: []runtime.Object{addontesting.SetAddonDeletionTimestamp(
+				addontesting.NewHostedModeAddonWithFinalizer(
+					"test", "cluster1", "cluster2", registrationAppliedCondition,
+				),
+				time.Now(),
+			)},
+			cluster: []runtime.Object{
+				addontesting.NewManagedCluster("cluster1"),
+				addontesting.NewManagedCluster("cluster2"),
+			},
+			existingWork:      []runtime.Object{getHostedDeployWork()},
+			blockWorkDeletion: true,
+			testaddon:         &testHostedAgent{name: "test"},
+			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "patch")
+			},
+			validateWorkActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "delete", "list")
+			},
+		},
+		{
+			name: "clean hosted works after the hosting cluster is confirmed absent",
+			key:  "cluster1/test",
+			addon: []runtime.Object{addontesting.SetAddonFinalizers(
+				addontesting.NewHostedModeAddon(
+					"test", "cluster1", "cluster2", registrationAppliedCondition,
+				),
+				addonapiv1beta1.AddonHostingManifestFinalizer,
+				addonapiv1beta1.AddonHostingPreDeleteHookFinalizer,
+			)},
+			cluster:      []runtime.Object{addontesting.NewManagedCluster("cluster1")},
+			existingWork: []runtime.Object{getHostedDeployWork()},
+			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "patch")
+				patch := actions[0].(clienttesting.PatchActionImpl).Patch
+				addOn := &addonapiv1beta1.ManagedClusterAddOn{}
+				if err := json.Unmarshal(patch, addOn); err != nil {
+					t.Fatal(err)
+				}
+				condition := meta.FindStatusCondition(
+					addOn.Status.Conditions,
+					addonapiv1beta1.ManagedClusterAddOnHostingClusterValidity,
+				)
+				if condition == nil || condition.Reason != addonapiv1beta1.HostingClusterValidityReasonInvalid {
+					t.Fatalf("expected invalid hosting cluster condition, got %#v", condition)
+				}
+			},
+			validateWorkActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "delete", "list", "list")
+			},
+			testaddon: &testHostedAgent{name: "test", objects: []runtime.Object{
+				addontesting.NewHostingUnstructured("v1", "ConfigMap", "default", "test"),
+			}},
+		},
+		{
 			name: "add finalizer",
 			key:  "cluster1/test",
 			addon: []runtime.Object{addontesting.NewHostedModeAddon("test", "cluster1", "cluster2",
@@ -153,6 +282,72 @@ func TestHostingReconcile(t *testing.T) {
 			}},
 		},
 		{
+			name: "clean all owned Works after the source cluster is confirmed absent",
+			key:  "cluster1/test",
+			addon: []runtime.Object{addontesting.SetAddonFinalizers(
+				addontesting.NewHostedModeAddon(
+					"test",
+					"cluster1",
+					"cluster2",
+					registrationAppliedCondition,
+					metav1.Condition{
+						Type:               addonapiv1beta1.ManagedClusterAddOnConditionAvailable,
+						Status:             metav1.ConditionUnknown,
+						ObservedGeneration: 0,
+						Reason:             managedClusterNotFoundReason,
+						Message:            "source managed cluster cluster1 is not found",
+					},
+				),
+				addonapiv1beta1.AddonHostingManifestFinalizer,
+				addonapiv1beta1.AddonHostingPreDeleteHookFinalizer,
+			)},
+			cluster: []runtime.Object{addontesting.NewManagedCluster("cluster2")},
+			existingWork: []runtime.Object{
+				getHostedDeployWork(),
+				getHostedHookWork(true),
+			},
+			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "update")
+				updated := actions[0].(clienttesting.UpdateActionImpl).Object.(*addonapiv1beta1.ManagedClusterAddOn)
+				if len(updated.Finalizers) != 0 {
+					t.Fatalf("expected framework finalizers to be removed, got %v", updated.Finalizers)
+				}
+			},
+			validateWorkActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "list", "delete", "delete", "list")
+			},
+			testaddon: &testHostedAgent{name: "test"},
+		},
+		{
+			name: "keep cleanup blocked when a deleting addon cannot render its protected hook",
+			key:  "cluster1/test",
+			addon: []runtime.Object{addontesting.SetAddonFinalizers(
+				addontesting.SetAddonDeletionTimestamp(
+					addontesting.NewHostedModeAddon(
+						"test",
+						"cluster1",
+						"cluster2",
+						registrationAppliedCondition,
+						metav1.Condition{
+							Type:               addonapiv1beta1.ManagedClusterAddOnConditionAvailable,
+							Status:             metav1.ConditionUnknown,
+							ObservedGeneration: 0,
+							Reason:             managedClusterNotFoundReason,
+							Message:            "source managed cluster cluster1 is not found",
+						},
+					),
+					time.Now(),
+				),
+				addonapiv1beta1.AddonHostingManifestFinalizer,
+				addonapiv1beta1.AddonHostingPreDeleteHookFinalizer,
+			)},
+			cluster:              []runtime.Object{addontesting.NewManagedCluster("cluster2")},
+			existingWork:         []runtime.Object{getHostedDeployWork()},
+			validateAddonActions: addontesting.AssertNoActions,
+			validateWorkActions:  addontesting.AssertNoActions,
+			testaddon:            &testHostedAgent{name: "test"},
+		},
+		{
 			name: "deploy manifests for an addon",
 			key:  "cluster1/test",
 			addon: []runtime.Object{addontesting.NewHostedModeAddonWithFinalizer("test", "cluster1", "cluster2",
@@ -166,8 +361,6 @@ func TestHostingReconcile(t *testing.T) {
 			}},
 			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
 				addontesting.AssertActions(t, actions, "patch")
-
-				assertHostingClusterValid(t, actions[0])
 
 				patch := actions[0].(clienttesting.PatchActionImpl).Patch
 				addOn := &addonapiv1beta1.ManagedClusterAddOn{}
@@ -209,10 +402,7 @@ func TestHostingReconcile(t *testing.T) {
 					addontesting.NewHostingUnstructured("v1", "ConfigMap", "default", "test1"),
 					addontesting.NewHostingUnstructured("v1", "Deployment", "default", "test1"),
 				)
-				work.SetLabels(map[string]string{
-					addonapiv1beta1.AddonLabelKey:          "test",
-					addonapiv1beta1.AddonNamespaceLabelKey: "cluster1",
-				})
+				setAddonWorkOwnership(work, "test", "cluster1")
 				work.Status.Conditions = []metav1.Condition{
 					{
 						Type:   workapiv1.WorkApplied,
@@ -227,8 +417,6 @@ func TestHostingReconcile(t *testing.T) {
 			},
 			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
 				addontesting.AssertActions(t, actions, "patch")
-
-				assertHostingClusterValid(t, actions[0])
 
 				patch := actions[0].(clienttesting.PatchActionImpl).Patch
 				addOn := &addonapiv1beta1.ManagedClusterAddOn{}
@@ -275,10 +463,7 @@ func TestHostingReconcile(t *testing.T) {
 					addontesting.NewHostingUnstructured("v1", "ConfigMap", "default", "test"),
 					addontesting.NewHostingUnstructured("v1", "Deployment", "default", "test"),
 				)
-				work.SetLabels(map[string]string{
-					addonapiv1beta1.AddonLabelKey:          "test",
-					addonapiv1beta1.AddonNamespaceLabelKey: "cluster1",
-				})
+				setAddonWorkOwnership(work, "test", "cluster1")
 				work.Status.Conditions = []metav1.Condition{
 					{
 						Type:   workapiv1.WorkApplied,
@@ -339,21 +524,132 @@ func TestHostingReconcile(t *testing.T) {
 			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
 				addontesting.AssertActions(t, actions, "patch")
 
-				assertHostingClusterValid(t, actions[0])
-
 				patch := actions[0].(clienttesting.PatchActionImpl).Patch
 				addOn := &addonapiv1beta1.ManagedClusterAddOn{}
 				err := json.Unmarshal(patch, addOn)
 				if err != nil {
 					t.Fatal(err)
 				}
-				if !meta.IsStatusConditionFalse(addOn.Status.Conditions, addonapiv1beta1.ManagedClusterAddOnHostingManifestApplied) {
+				if !meta.IsStatusConditionFalse(addOn.Status.Conditions, addonapiv1beta1.ManagedClusterAddOnManifestApplied) {
 					t.Errorf("Condition Reason is not correct: %v", addOn.Status.Conditions)
 				}
 			},
 		},
 		{
-			name: "delete finalizer",
+			name: "default to hosted deletes the default Work before creating the hosted Work",
+			key:  "cluster1/test",
+			addon: []runtime.Object{addontesting.NewHostedModeAddonWithFinalizer(
+				"test", "cluster1", "cluster2", registrationAppliedCondition,
+			)},
+			cluster: []runtime.Object{
+				addontesting.NewManagedCluster("cluster1"),
+				addontesting.NewManagedCluster("cluster2"),
+			},
+			existingWork: []runtime.Object{getDeployWork()},
+			testaddon: &testHostedAgent{name: "test", objects: []runtime.Object{
+				addontesting.NewHostingUnstructured("v1", "ConfigMap", "default", "test"),
+			}},
+			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "patch")
+				assertHostingClusterValid(t, actions[0])
+			},
+			validateWorkActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "delete", "create")
+				if actions[0].GetNamespace() != "cluster1" {
+					t.Errorf("expected default Work deletion first, got namespace %s", actions[0].GetNamespace())
+				}
+				if actions[1].GetNamespace() != "cluster2" {
+					t.Errorf("expected hosted Work creation second, got namespace %s", actions[1].GetNamespace())
+				}
+			},
+		},
+		{
+			name: "delete stale work before creating it on a new hosting cluster",
+			key:  "cluster1/test",
+			addon: []runtime.Object{addontesting.NewHostedModeAddonWithFinalizer(
+				"test", "cluster1", "cluster3", registrationAppliedCondition,
+			)},
+			cluster: []runtime.Object{
+				addontesting.NewManagedCluster("cluster1"),
+				addontesting.NewManagedCluster("cluster2"),
+				addontesting.NewManagedCluster("cluster3"),
+			},
+			existingWork: []runtime.Object{getHostedDeployWork()},
+			testaddon: &testHostedAgent{name: "test", objects: []runtime.Object{
+				addontesting.NewHostingUnstructured("v1", "ConfigMap", "default", "test"),
+			}},
+			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "patch")
+				assertHostingClusterValid(t, actions[0])
+			},
+			validateWorkActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "delete", "create")
+				deleteAction := actions[0].(clienttesting.DeleteActionImpl)
+				if deleteAction.Namespace != "cluster2" {
+					t.Errorf("expected stale Work deletion from cluster2, got %s", deleteAction.Namespace)
+				}
+				created := actions[1].(clienttesting.CreateActionImpl).Object.(*workapiv1.ManifestWork)
+				if created.Namespace != "cluster3" {
+					t.Errorf("expected desired Work creation in cluster3, got %s", created.Namespace)
+				}
+			},
+		},
+		{
+			name: "delete the last hosted work when desired manifests become empty",
+			key:  "cluster1/test",
+			addon: []runtime.Object{addontesting.NewHostedModeAddonWithFinalizer(
+				"test", "cluster1", "cluster2", registrationAppliedCondition,
+			)},
+			cluster: []runtime.Object{
+				addontesting.NewManagedCluster("cluster1"),
+				addontesting.NewManagedCluster("cluster2"),
+			},
+			existingWork: []runtime.Object{getHostedDeployWork()},
+			testaddon:    &testHostedAgent{name: "test"},
+			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "patch")
+				assertHostingClusterValid(t, actions[0])
+			},
+			validateWorkActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "delete")
+			},
+		},
+		{
+			name: "hosted mode disablement cleans work before removing its cleanup finalizer",
+			key:  "cluster1/test",
+			addon: []runtime.Object{addontesting.SetAddonFinalizers(
+				addontesting.NewHostedModeAddon("test", "cluster1", "cluster2", registrationAppliedCondition),
+				addonapiv1beta1.AddonHostingManifestFinalizer,
+				addonapiv1beta1.AddonHostingPreDeleteHookFinalizer,
+			)},
+			cluster: []runtime.Object{
+				addontesting.NewManagedCluster("cluster1"),
+				addontesting.NewManagedCluster("cluster2"),
+			},
+			existingWork: []runtime.Object{getHostedDeployWork()},
+			testaddon: &testHostedAgent{
+				name:               "test",
+				hostedModeDisabled: true,
+				objects: []runtime.Object{
+					addontesting.NewUnstructured("v1", "ConfigMap", "default", "test"),
+				},
+			},
+			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "update")
+				updated := actions[0].(clienttesting.UpdateActionImpl).Object.(*addonapiv1beta1.ManagedClusterAddOn)
+				if addonHasFinalizer(updated, addonapiv1beta1.AddonHostingManifestFinalizer) {
+					t.Error("expected hosting cleanup finalizer to be removed")
+				}
+				if addonHasFinalizer(updated, addonapiv1beta1.AddonHostingPreDeleteHookFinalizer) {
+					t.Error("expected hosted hook finalizer to be removed after hook cleanup")
+				}
+			},
+			validateWorkActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "delete", "list", "create", "list")
+			},
+		},
+		{
+			name: "persist status before deleting finalizer",
 			key:  "cluster1/test",
 			addon: []runtime.Object{addontesting.SetAddonDeletionTimestamp(
 				addontesting.NewHostedModeAddonWithFinalizer("test", "cluster1", "cluster2",
@@ -375,10 +671,7 @@ func TestHostingReconcile(t *testing.T) {
 					addontesting.NewHostingUnstructured("v1", "ConfigMap", "default", "test"),
 					addontesting.NewHostingUnstructured("v1", "Deployment", "default", "test"),
 				)
-				work.Labels = map[string]string{
-					addonapiv1beta1.AddonLabelKey:          "test",
-					addonapiv1beta1.AddonNamespaceLabelKey: "cluster1",
-				}
+				setAddonWorkOwnership(work, "test", "cluster1")
 				work.Status.Conditions = []metav1.Condition{
 					{
 						Type:   workapiv1.WorkApplied,
@@ -388,16 +681,10 @@ func TestHostingReconcile(t *testing.T) {
 				return work
 			}()},
 			validateWorkActions: func(t *testing.T, actions []clienttesting.Action) {
-				// hosted sync deletes the deploy work in the hosting cluster ns
-				addontesting.AssertActions(t, actions, "delete")
+				addontesting.AssertActions(t, actions, "delete", "list", "list")
 			},
 			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
-				addontesting.AssertActions(t, actions, "update")
-				update := actions[0].(clienttesting.UpdateActionImpl).Object
-				addOn := update.(*addonapiv1beta1.ManagedClusterAddOn)
-				if addonHasFinalizer(addOn, addonapiv1beta1.AddonHostingManifestFinalizer) {
-					t.Errorf("expected hosting manifest finalizer")
-				}
+				addontesting.AssertActions(t, actions, "patch")
 			},
 		},
 		{
@@ -491,21 +778,7 @@ func TestHostingReconcile(t *testing.T) {
 					"cluster2",
 					addontesting.NewHostingUnstructured("v1", "ConfigMap", "default", "test"),
 				)
-				work.SetLabels(map[string]string{
-					addonapiv1beta1.AddonLabelKey:          "test",
-					addonapiv1beta1.AddonNamespaceLabelKey: "cluster1",
-				})
-				pTrue := true
-				work.SetOwnerReferences([]metav1.OwnerReference{
-					{
-						APIVersion:         "addon.open-cluster-management.io/v1beta1",
-						Kind:               "ManagedClusterAddOn",
-						Name:               "test",
-						UID:                "",
-						Controller:         &pTrue,
-						BlockOwnerDeletion: &pTrue,
-					},
-				})
+				setAddonWorkOwnership(work, "test", "cluster1")
 				// ManifestWork created but work-agent hasn't reported status yet (WorkApplied is nil)
 				work.Status.Conditions = []metav1.Condition{}
 				return work
@@ -558,21 +831,7 @@ func TestHostingReconcile(t *testing.T) {
 					"cluster2",
 					addontesting.NewHostingUnstructured("v1", "ConfigMap", "default", "test"),
 				)
-				work.SetLabels(map[string]string{
-					addonapiv1beta1.AddonLabelKey:          "test",
-					addonapiv1beta1.AddonNamespaceLabelKey: "cluster1",
-				})
-				pTrue := true
-				work.SetOwnerReferences([]metav1.OwnerReference{
-					{
-						APIVersion:         "addon.open-cluster-management.io/v1beta1",
-						Kind:               "ManagedClusterAddOn",
-						Name:               "test",
-						UID:                "",
-						Controller:         &pTrue,
-						BlockOwnerDeletion: &pTrue,
-					},
-				})
+				setAddonWorkOwnership(work, "test", "cluster1")
 				// ManifestWork exists but work-agent hasn't reported new status yet
 				work.Status.Conditions = []metav1.Condition{}
 				return work
@@ -605,8 +864,15 @@ func TestHostingReconcile(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			fakeWorkClient := fakework.NewSimpleClientset(c.existingWork...)
-			fakeClusterClient := fakecluster.NewSimpleClientset(c.cluster...)
+			clusterObjects := c.cluster
+			if c.liveCluster != nil {
+				clusterObjects = c.liveCluster
+			}
+			fakeClusterClient := fakecluster.NewSimpleClientset(clusterObjects...)
 			fakeAddonClient := fakeaddon.NewSimpleClientset(c.addon...)
+			if c.blockWorkDeletion {
+				blockManifestWorkDeletion(fakeWorkClient)
+			}
 
 			workInformerFactory := workinformers.NewSharedInformerFactory(fakeWorkClient, 10*time.Minute)
 			addonInformers := addoninformers.NewSharedInformerFactory(fakeAddonClient, 10*time.Minute)
@@ -641,9 +907,11 @@ func TestHostingReconcile(t *testing.T) {
 			}
 
 			controller := addonDeployController{
+				workClient:                fakeWorkClient,
 				workApplier:               workapplier.NewWorkApplierWithTypedClient(fakeWorkClient, workInformerFactory.Work().V1().ManifestWorks().Lister()),
 				workBuilder:               workbuilder.NewWorkBuilder(),
 				addonClient:               fakeAddonClient,
+				clusterClient:             fakeClusterClient,
 				managedClusterLister:      clusterInformers.Cluster().V1().ManagedClusters().Lister(),
 				managedClusterAddonLister: addonInformers.Addon().V1beta1().ManagedClusterAddOns().Lister(),
 				workIndexer:               workInformerFactory.Work().V1().ManifestWorks().Informer().GetIndexer(),
@@ -652,16 +920,45 @@ func TestHostingReconcile(t *testing.T) {
 
 			syncContext := addontesting.NewFakeSyncContext(t)
 			err = controller.sync(context.TODO(), syncContext, c.key)
-			if (err == nil && c.testaddon.err != nil) || (err != nil && c.testaddon.err == nil) {
+			switch {
+			case c.blockWorkDeletion:
+				if err == nil {
+					t.Errorf("expected an error when the work deletion is not observable yet")
+				}
+			case (err == nil) != (c.testaddon.err == nil):
 				t.Errorf("expected error %v when sync got %v", c.testaddon.err, err)
-			}
-			if err != nil && c.testaddon.err != nil && err.Error() != c.testaddon.err.Error() {
+			case err != nil && err.Error() != c.testaddon.err.Error():
 				t.Errorf("expected error %v when sync got %v", c.testaddon.err, err)
 			}
 			c.validateAddonActions(t, fakeAddonClient.Actions())
 			c.validateWorkActions(t, fakeWorkClient.Actions())
 		})
 	}
+}
+
+func assertSourceClusterBlocked(t *testing.T, action clienttesting.Action) {
+	addOnCond := patchedAvailableCondition(t, action)
+	if addOnCond == nil {
+		t.Fatal("condition should not be nil")
+	}
+	if addOnCond.Reason != managedClusterNotFoundReason {
+		t.Errorf("Condition Reason is not correct: %v", addOnCond.Reason)
+	}
+}
+
+func assertSourceClusterUnblocked(t *testing.T, action clienttesting.Action) {
+	if addOnCond := patchedAvailableCondition(t, action); addOnCond != nil {
+		t.Errorf("stale source cluster condition should be removed, but got: %v", addOnCond.Reason)
+	}
+}
+
+func patchedAvailableCondition(t *testing.T, action clienttesting.Action) *metav1.Condition {
+	patch := action.(clienttesting.PatchActionImpl).Patch
+	addOn := &addonapiv1beta1.ManagedClusterAddOn{}
+	if err := json.Unmarshal(patch, addOn); err != nil {
+		t.Fatal(err)
+	}
+	return meta.FindStatusCondition(addOn.Status.Conditions, addonapiv1beta1.ManagedClusterAddOnConditionAvailable)
 }
 
 func assertHostingClusterValid(t *testing.T, actions clienttesting.Action) {

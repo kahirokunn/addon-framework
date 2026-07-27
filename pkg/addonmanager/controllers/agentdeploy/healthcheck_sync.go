@@ -137,10 +137,7 @@ func (s *healthCheckSyncer) probeAddonStatusByWorks(
 
 	var addonManifestWorks []*workapiv1.ManifestWork
 	var err error
-	installMode := constants.InstallModeDefault
-	if s.agentAddon.GetAgentAddonOptions().HostedModeInfoFunc != nil {
-		installMode, _ = s.agentAddon.GetAgentAddonOptions().HostedModeInfoFunc(addon, cluster)
-	}
+	installMode, _ := s.agentAddon.GetAgentAddonOptions().InstallMode(addon, cluster)
 	if installMode == constants.InstallModeHosted {
 		addonManifestWorks, err = s.getWorkByHostedAddon(addon.Name, addon.Namespace)
 	} else {

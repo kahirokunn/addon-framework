@@ -9,14 +9,93 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	clienttesting "k8s.io/client-go/testing"
 	addonapiv1alpha1 "open-cluster-management.io/api/addon/v1alpha1"
 	addonapiv1beta1 "open-cluster-management.io/api/addon/v1beta1"
+	fakework "open-cluster-management.io/api/client/work/clientset/versioned/fake"
 	workapiv1 "open-cluster-management.io/api/work/v1"
 
 	"open-cluster-management.io/addon-framework/pkg/addonmanager/addontesting"
+	"open-cluster-management.io/addon-framework/pkg/addonmanager/constants"
 	"open-cluster-management.io/addon-framework/pkg/agent"
 	"open-cluster-management.io/addon-framework/pkg/utils"
 )
+
+// blockManifestWorkDeletion makes the fake client accept a delete without the work ever becoming
+// observable as deleting.
+func blockManifestWorkDeletion(client *fakework.Clientset) {
+	client.PrependReactor("delete", "manifestworks",
+		func(clienttesting.Action) (bool, runtime.Object, error) {
+			return true, nil, nil
+		})
+}
+
+// setAddonWorkOwnership stamps the labels and the ownerReferences the addon-framework applies to the
+// manifestWorks of the addon, the works in a hosting cluster ns have no ownerRef.
+func setAddonWorkOwnership(work *workapiv1.ManifestWork, addonName, addonNamespace string) *workapiv1.ManifestWork {
+	addon := addontesting.NewAddon(addonName, addonNamespace)
+	work.SetLabels(newAddonWorkLabels(addon, work.Namespace))
+	if work.Namespace == addonNamespace {
+		work.SetOwnerReferences([]metav1.OwnerReference{*newAddonOwnerRef(addon)})
+	}
+	return work
+}
+
+func TestPartitionWorksForTarget(t *testing.T) {
+	addon := addontesting.NewAddon("test", "cluster1")
+
+	currentWork := &workapiv1.ManifestWork{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "cluster2", Labels: newAddonWorkLabels(addon, "cluster2")}}
+	staleWork := currentWork.DeepCopy()
+	staleWork.Labels[constants.AddonSourceUIDLabelKey] = "uid-old"
+	staleNamespaceWork := &workapiv1.ManifestWork{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "cluster3", Labels: newAddonWorkLabels(addon, "cluster3")}}
+	foreignWork := currentWork.DeepCopy()
+	foreignWork.Labels[constants.AddonFrameworkManagedByLabelKey] = "another-controller"
+
+	current, stale := partitionWorksForTarget(addon, "cluster2",
+		[]*workapiv1.ManifestWork{currentWork, staleWork, staleNamespaceWork, foreignWork})
+	assert.Equal(t, []*workapiv1.ManifestWork{currentWork}, current)
+	assert.Equal(t, []*workapiv1.ManifestWork{staleWork, staleNamespaceWork}, stale)
+}
+
+func TestDeleteWorksAndVerifyIgnoresForeignWorks(t *testing.T) {
+	addon := addontesting.NewAddon("test", "cluster1")
+	ownedWork := &workapiv1.ManifestWork{ObjectMeta: metav1.ObjectMeta{
+		Name: "owned", Namespace: "cluster2", Labels: newAddonWorkLabels(addon, "cluster2")}}
+	foreignWork := ownedWork.DeepCopy()
+	foreignWork.Name = "foreign"
+	foreignWork.Labels[constants.AddonFrameworkManagedByLabelKey] = "another-controller"
+
+	var deleted []types.NamespacedName
+	err := deleteWorksAndVerify(
+		context.Background(),
+		func(_ context.Context, namespace, name string) error {
+			deleted = append(deleted, types.NamespacedName{Namespace: namespace, Name: name})
+			return nil
+		},
+		func(context.Context, string, string) ([]*workapiv1.ManifestWork, error) {
+			return []*workapiv1.ManifestWork{foreignWork}, nil
+		},
+		addon.Name,
+		addon.Namespace,
+		[]*workapiv1.ManifestWork{ownedWork, foreignWork},
+	)
+
+	assert.NoError(t, err)
+	assert.Equal(t, []types.NamespacedName{{Namespace: "cluster2", Name: "owned"}}, deleted)
+}
+
+func TestNewAddonWorkLabels(t *testing.T) {
+	addon := addontesting.NewAddon("test", "cluster1")
+	labels := newAddonWorkLabels(addon, "cluster2")
+
+	assert.Equal(t, addon.Name, labels[addonapiv1beta1.AddonLabelKey])
+	assert.Equal(t, addon.Namespace, labels[addonapiv1beta1.AddonNamespaceLabelKey])
+	assert.Equal(t, string(addon.UID), labels[constants.AddonSourceUIDLabelKey])
+	assert.Equal(t, constants.AddonFrameworkManagedByLabelValue,
+		labels[constants.AddonFrameworkManagedByLabelKey])
+}
 
 func TestConfigsToAnnotations(t *testing.T) {
 	cases := []struct {

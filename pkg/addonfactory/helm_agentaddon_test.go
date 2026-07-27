@@ -272,7 +272,7 @@ func TestChartAgentAddon_Manifests(t *testing.T) {
 				WithAgentRegistrationOption(&agent.RegistrationOption{})
 			if c.getHostingClusterWithClient && c.hostingCluster != nil {
 				clusterClient := clusterclientset.NewSimpleClientset(c.hostingCluster)
-				factory = factory.WithManagedClusterClient(clusterClient)
+				factory = factory.WithManagedClusterClient(clusterClient).WithAgentHostedModeEnabledOption()
 				clusterAddon.Annotations[addonapiv1beta1.HostingClusterNameAnnotationKey] = c.hostingCluster.Name
 			}
 			agentAddon, err := factory.BuildHelmAgentAddon()

@@ -96,15 +96,36 @@ func TestDefaultReconcile(t *testing.T) {
 			}},
 		},
 		{
-			name:                 "no addon",
-			key:                  "cluster1/test",
-			cluster:              []runtime.Object{addontesting.NewManagedCluster("cluster1")},
-			existingWork:         []runtime.Object{},
-			validateAddonActions: addontesting.AssertNoActions,
-			validateWorkActions:  addontesting.AssertNoActions,
+			name:         "no addon",
+			key:          "cluster1/test",
+			cluster:      []runtime.Object{addontesting.NewManagedCluster("cluster1")},
+			existingWork: []runtime.Object{},
+			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "get")
+			},
+			validateWorkActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "list")
+			},
 			testaddon: &testAgent{name: "test", objects: []runtime.Object{
 				addontesting.NewUnstructured("v1", "ConfigMap", "default", "test"),
 			}},
+		},
+		{
+			name:         "delete an owned hosted Work after its source addon is gone",
+			key:          "cluster1/test",
+			cluster:      []runtime.Object{addontesting.NewManagedCluster("cluster1")},
+			existingWork: []runtime.Object{getHostedDeployWork()},
+			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "get")
+			},
+			validateWorkActions: func(t *testing.T, actions []clienttesting.Action) {
+				addontesting.AssertActions(t, actions, "list", "delete", "list")
+				deleted := actions[1].(clienttesting.DeleteActionImpl)
+				if deleted.Namespace != "cluster2" {
+					t.Errorf("expected orphan deletion from cluster2, got %s", deleted.Namespace)
+				}
+			},
+			testaddon: &testAgent{name: "test"},
 		},
 		{
 			name:    "deploy manifests for an addon",
@@ -135,9 +156,7 @@ func TestDefaultReconcile(t *testing.T) {
 					addontesting.NewUnstructured("v1", "ConfigMap", "default", "test1"),
 					addontesting.NewUnstructured("v1", "Deployment", "default", "test1"),
 				)
-				work.SetLabels(map[string]string{
-					addonapiv1beta1.AddonLabelKey: "test",
-				})
+				setAddonWorkOwnership(work, "test", "cluster1")
 				work.Status.Conditions = []metav1.Condition{
 					{
 						Type:   workapiv1.WorkApplied,
@@ -178,20 +197,7 @@ func TestDefaultReconcile(t *testing.T) {
 					addontesting.NewUnstructured("v1", "ConfigMap", "default", "test"),
 					addontesting.NewUnstructured("v1", "Deployment", "default", "test"),
 				)
-				work.SetLabels(map[string]string{
-					addonapiv1beta1.AddonLabelKey: "test",
-				})
-				pTrue := true
-				work.SetOwnerReferences([]metav1.OwnerReference{
-					{
-						APIVersion:         "addon.open-cluster-management.io/v1beta1",
-						Kind:               "ManagedClusterAddOn",
-						Name:               "test",
-						UID:                "",
-						Controller:         &pTrue,
-						BlockOwnerDeletion: &pTrue,
-					},
-				})
+				setAddonWorkOwnership(work, "test", "cluster1")
 				work.Status.Conditions = []metav1.Condition{
 					{
 						Type:   workapiv1.WorkApplied,
@@ -301,20 +307,7 @@ func TestDefaultReconcile(t *testing.T) {
 					"cluster1",
 					addontesting.NewUnstructured("v1", "ConfigMap", "default", "test"),
 				)
-				work.SetLabels(map[string]string{
-					addonapiv1beta1.AddonLabelKey: "test",
-				})
-				pTrue := true
-				work.SetOwnerReferences([]metav1.OwnerReference{
-					{
-						APIVersion:         "addon.open-cluster-management.io/v1beta1",
-						Kind:               "ManagedClusterAddOn",
-						Name:               "test",
-						UID:                "",
-						Controller:         &pTrue,
-						BlockOwnerDeletion: &pTrue,
-					},
-				})
+				setAddonWorkOwnership(work, "test", "cluster1")
 				// ManifestWork created but work-agent hasn't reported status yet (WorkApplied is nil)
 				work.Status.Conditions = []metav1.Condition{}
 				return work
@@ -357,20 +350,7 @@ func TestDefaultReconcile(t *testing.T) {
 					"cluster1",
 					addontesting.NewUnstructured("v1", "ConfigMap", "default", "test"),
 				)
-				work.SetLabels(map[string]string{
-					addonapiv1beta1.AddonLabelKey: "test",
-				})
-				pTrue := true
-				work.SetOwnerReferences([]metav1.OwnerReference{
-					{
-						APIVersion:         "addon.open-cluster-management.io/v1beta1",
-						Kind:               "ManagedClusterAddOn",
-						Name:               "test",
-						UID:                "",
-						Controller:         &pTrue,
-						BlockOwnerDeletion: &pTrue,
-					},
-				})
+				setAddonWorkOwnership(work, "test", "cluster1")
 				// ManifestWork exists but work-agent hasn't reported new status yet
 				work.Status.Conditions = []metav1.Condition{}
 				return work
@@ -423,9 +403,11 @@ func TestDefaultReconcile(t *testing.T) {
 			}
 
 			controller := addonDeployController{
+				workClient:                fakeWorkClient,
 				workApplier:               workapplier.NewWorkApplierWithTypedClient(fakeWorkClient, workInformerFactory.Work().V1().ManifestWorks().Lister()),
 				workBuilder:               workbuilder.NewWorkBuilder(),
 				addonClient:               fakeAddonClient,
+				clusterClient:             fakeClusterClient,
 				managedClusterLister:      clusterInformers.Cluster().V1().ManagedClusters().Lister(),
 				managedClusterAddonLister: addonInformers.Addon().V1beta1().ManagedClusterAddOns().Lister(),
 				workIndexer:               workInformerFactory.Work().V1().ManifestWorks().Informer().GetIndexer(),

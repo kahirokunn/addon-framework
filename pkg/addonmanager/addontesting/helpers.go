@@ -11,6 +11,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
 	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/util/workqueue"
 
@@ -84,34 +85,22 @@ func NewAddon(name, namespace string, owners ...metav1.OwnerReference) *addonapi
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            name,
 			Namespace:       namespace,
+			UID:             types.UID(fmt.Sprintf("%s-%s-uid", namespace, name)),
 			OwnerReferences: owners,
 		},
 	}
 }
 func NewAddonWithConditions(name, namespace string, conditions ...metav1.Condition) *addonapiv1beta1.ManagedClusterAddOn {
-	return &addonapiv1beta1.ManagedClusterAddOn{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-		},
-		Status: addonapiv1beta1.ManagedClusterAddOnStatus{
-			Conditions: conditions,
-		},
-	}
+	addon := NewAddon(name, namespace)
+	addon.Status.Conditions = conditions
+	return addon
 }
 
 func NewHostedModeAddon(name, namespace string, hostingCluster string,
 	conditions ...metav1.Condition) *addonapiv1beta1.ManagedClusterAddOn {
-	return &addonapiv1beta1.ManagedClusterAddOn{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        name,
-			Namespace:   namespace,
-			Annotations: map[string]string{addonapiv1beta1.HostingClusterNameAnnotationKey: hostingCluster},
-		},
-		Status: addonapiv1beta1.ManagedClusterAddOnStatus{
-			Conditions: conditions,
-		},
-	}
+	addon := NewAddonWithConditions(name, namespace, conditions...)
+	addon.SetAnnotations(map[string]string{addonapiv1beta1.HostingClusterNameAnnotationKey: hostingCluster})
+	return addon
 }
 
 func NewHostedModeAddonWithFinalizer(name, namespace string, hostingCluster string,

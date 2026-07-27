@@ -35,22 +35,8 @@ func getDeployWork() *workapiv1.ManifestWork {
 		"cluster1",
 		addontesting.NewUnstructured("v1", "ConfigMap", "default", "test"),
 	)
-	work.Labels = map[string]string{
-		addonapiv1beta1.AddonLabelKey: "test",
-	}
+	setAddonWorkOwnership(work, "test", "cluster1")
 
-	pTrue := true
-
-	work.SetOwnerReferences([]metav1.OwnerReference{
-		{
-			APIVersion:         "addon.open-cluster-management.io/v1beta1",
-			Kind:               "ManagedClusterAddOn",
-			Name:               "test",
-			UID:                "",
-			Controller:         &pTrue,
-			BlockOwnerDeletion: &pTrue,
-		},
-	})
 	work.Spec.ManifestConfigs = []workapiv1.ManifestConfigOption{}
 	work.Status.Conditions = []metav1.Condition{}
 	work.Status.ResourceStatus = workapiv1.ManifestResourceStatus{}
@@ -157,22 +143,7 @@ func TestDefaultHookReconcile(t *testing.T) {
 						// work change during predelete hook.
 						addontesting.NewUnstructured("v1", "ConfigMap", "default", "test2"),
 					)
-					work.Labels = map[string]string{
-						addonapiv1beta1.AddonLabelKey: "test",
-					}
-
-					pTrue := true
-
-					work.SetOwnerReferences([]metav1.OwnerReference{
-						{
-							APIVersion:         "addon.open-cluster-management.io/v1beta1",
-							Kind:               "ManagedClusterAddOn",
-							Name:               "test",
-							UID:                "",
-							Controller:         &pTrue,
-							BlockOwnerDeletion: &pTrue,
-						},
-					})
+					setAddonWorkOwnership(work, "test", "cluster1")
 					work.Spec.ManifestConfigs = []workapiv1.ManifestConfigOption{}
 					work.Status.Conditions = []metav1.Condition{}
 					work.Status.ResourceStatus = workapiv1.ManifestResourceStatus{}
@@ -228,18 +199,7 @@ func TestDefaultHookReconcile(t *testing.T) {
 						"cluster1",
 						addontesting.NewHookJob("test", "default"),
 					)
-					work.SetLabels(map[string]string{addonapiv1beta1.AddonLabelKey: "test"})
-					pTrue := true
-					work.SetOwnerReferences([]metav1.OwnerReference{
-						{
-							APIVersion:         "addon.open-cluster-management.io/v1beta1",
-							Kind:               "ManagedClusterAddOn",
-							Name:               "test",
-							UID:                "",
-							Controller:         &pTrue,
-							BlockOwnerDeletion: &pTrue,
-						},
-					})
+					setAddonWorkOwnership(work, "test", "cluster1")
 					work.Spec.ManifestConfigs = []workapiv1.ManifestConfigOption{
 						{
 							ResourceIdentifier: workapiv1.ResourceIdentifier{
@@ -294,17 +254,22 @@ func TestDefaultHookReconcile(t *testing.T) {
 			},
 			validateWorkActions: addontesting.AssertNoActions,
 			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
-				// delete finalizer, patch completed condition.
-				addontesting.AssertActions(t, actions, "update")
-				actual := actions[0].(clienttesting.UpdateActionImpl).Object
-				addOn := actual.(*addonapiv1beta1.ManagedClusterAddOn)
-				if addonHasFinalizer(addOn, addonapiv1beta1.AddonPreDeleteHookFinalizer) {
-					t.Errorf("expected no pre delete hook finalizer on managedCluster.")
+				addontesting.AssertActions(t, actions, "patch")
+				patch := actions[0].(clienttesting.PatchActionImpl).Patch
+				addOn := &addonapiv1beta1.ManagedClusterAddOn{}
+				if err := json.Unmarshal(patch, addOn); err != nil {
+					t.Fatal(err)
+				}
+				if !meta.IsStatusConditionTrue(
+					addOn.Status.Conditions,
+					addonapiv1beta1.ManagedClusterAddOnHookManifestCompleted,
+				) {
+					t.Error("HookManifestCompleted condition should be true, but got false.")
 				}
 			},
 		},
 		{
-			name: "deploy hook manifest for a deleting addon without finalizer, completed",
+			name: "do not recreate hook for a deleting addon without finalizer",
 			key:  "cluster1/test",
 			addon: []runtime.Object{
 				addontesting.SetAddonDeletionTimestamp(
@@ -373,11 +338,8 @@ func TestDefaultHookReconcile(t *testing.T) {
 					return work
 				}(),
 			},
-			validateWorkActions: addontesting.AssertNoActions,
-			validateAddonActions: func(t *testing.T, actions []clienttesting.Action) {
-				// add finalizer
-				addontesting.AssertActions(t, actions, "update")
-			},
+			validateWorkActions:  addontesting.AssertNoActions,
+			validateAddonActions: addontesting.AssertNoActions,
 		},
 		{
 			name:    "deploy hook manifest when ConfigCheckEnabled is true",
@@ -457,9 +419,11 @@ func TestDefaultHookReconcile(t *testing.T) {
 			}
 
 			controller := addonDeployController{
+				workClient:                fakeWorkClient,
 				workApplier:               workapplier.NewWorkApplierWithTypedClient(fakeWorkClient, workInformerFactory.Work().V1().ManifestWorks().Lister()),
 				workBuilder:               workbuilder.NewWorkBuilder(),
 				addonClient:               fakeAddonClient,
+				clusterClient:             fakeClusterClient,
 				managedClusterLister:      clusterInformers.Cluster().V1().ManagedClusters().Lister(),
 				managedClusterAddonLister: addonInformers.Addon().V1beta1().ManagedClusterAddOns().Lister(),
 				workIndexer:               workInformerFactory.Work().V1().ManifestWorks().Informer().GetIndexer(),
