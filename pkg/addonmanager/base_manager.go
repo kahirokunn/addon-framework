@@ -12,6 +12,7 @@ import (
 
 	addonclient "open-cluster-management.io/api/client/addon/clientset/versioned"
 	addoninformers "open-cluster-management.io/api/client/addon/informers/externalversions"
+	clusterclient "open-cluster-management.io/api/client/cluster/clientset/versioned"
 	clusterv1informers "open-cluster-management.io/api/client/cluster/informers/externalversions"
 	workclientset "open-cluster-management.io/api/client/work/clientset/versioned"
 	workv1informers "open-cluster-management.io/api/client/work/informers/externalversions/work/v1"
@@ -138,6 +139,11 @@ func (a *BaseAddonManagerImpl) StartWithInformers(ctx context.Context,
 		return err
 	}
 
+	clusterClient, err := clusterclient.NewForConfig(a.config)
+	if err != nil {
+		return err
+	}
+
 	for _, agentImpl := range a.addonAgents {
 		for _, configGVR := range agentImpl.GetAgentAddonOptions().SupportedConfigGVRs {
 			a.addonConfigs[configGVR] = true
@@ -147,6 +153,7 @@ func (a *BaseAddonManagerImpl) StartWithInformers(ctx context.Context,
 	deployController := agentdeploy.NewAddonDeployController(
 		workClient,
 		addonClient,
+		clusterClient,
 		clusterInformers.Cluster().V1().ManagedClusters(),
 		addonInformers.Addon().V1beta1().ManagedClusterAddOns(),
 		workInformers,

@@ -10,6 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/klog/v2"
 
 	addonapiv1alpha1 "open-cluster-management.io/api/addon/v1alpha1"
@@ -32,7 +33,7 @@ func addonHasFinalizer(addon *addonapiv1beta1.ManagedClusterAddOn, finalizer str
 	return false
 }
 
-func addonRemoveFinalizer(addon *addonapiv1beta1.ManagedClusterAddOn, finalizer string) bool {
+func addonRemoveFinalizer(addon *addonapiv1beta1.ManagedClusterAddOn, finalizer string) {
 	var rst []string
 	for _, f := range addon.Finalizers {
 		if f == finalizer {
@@ -48,9 +49,7 @@ func addonRemoveFinalizer(addon *addonapiv1beta1.ManagedClusterAddOn, finalizer 
 	}
 	if len(rst) != len(addon.Finalizers) {
 		addon.SetFinalizers(rst)
-		return true
 	}
-	return false
 }
 
 func addonAddFinalizer(addon *addonapiv1beta1.ManagedClusterAddOn, finalizer string) bool {
@@ -81,7 +80,111 @@ func addonAddFinalizer(addon *addonapiv1beta1.ManagedClusterAddOn, finalizer str
 	return true
 }
 
-func newManifestWork(addonNamespace, addonName, clusterName string, manifests []workapiv1.Manifest,
+// partitionWorksForTarget splits the manifestWorks into the ones of the current addon in the given
+// work namespace, and the stale ones.
+func partitionWorksForTarget(
+	addon *addonapiv1beta1.ManagedClusterAddOn,
+	workNamespace string,
+	works []*workapiv1.ManifestWork,
+) (current, stale []*workapiv1.ManifestWork) {
+	for _, work := range works {
+		if !isAddonFrameworkWork(work) {
+			continue
+		}
+
+		// the works applied before the source uid label was introduced have no uid to compare with.
+		sourceUID := work.Labels[constants.AddonSourceUIDLabelKey]
+		if work.Namespace != workNamespace || (sourceUID != "" && sourceUID != string(addon.UID)) {
+			stale = append(stale, work)
+			continue
+		}
+
+		current = append(current, work)
+	}
+
+	return current, stale
+}
+
+// isAddonFrameworkWork accepts unlabeled ManifestWorks for compatibility with works created before
+// the managed-by label was introduced, but never adopts a work explicitly owned by another manager.
+func isAddonFrameworkWork(work *workapiv1.ManifestWork) bool {
+	managedBy, hasManagedBy := work.Labels[constants.AddonFrameworkManagedByLabelKey]
+	return !hasManagedBy || managedBy == constants.AddonFrameworkManagedByLabelValue
+}
+
+// cleanupAddonWorks deletes the cached manifestWorks of the addon. confirmOnHub is set when a
+// finalizer is about to be released, so that the hub is checked even if nothing is cached.
+func cleanupAddonWorks(ctx context.Context,
+	getWorks func(addonName, addonNamespace string) ([]*workapiv1.ManifestWork, error),
+	listWorks listWorksByAddonFunc,
+	deleteWork func(ctx context.Context, workNamespace, workName string) error,
+	addon *addonapiv1beta1.ManagedClusterAddOn, confirmOnHub bool) error {
+	currentWorks, err := getWorks(addon.Name, addon.Namespace)
+	if err != nil {
+		return err
+	}
+	if len(currentWorks) == 0 && !confirmOnHub {
+		return nil
+	}
+
+	return deleteWorksAndVerify(ctx, deleteWork, listWorks, addon.Name, addon.Namespace, currentWorks)
+}
+
+// deleteWorksAndVerify deletes the given manifestWorks and confirms on the hub that the deletion has
+// started, since the cache may not have observed all the works yet.
+func deleteWorksAndVerify(ctx context.Context,
+	deleteWork func(ctx context.Context, workNamespace, workName string) error,
+	listWorks listWorksByAddonFunc,
+	addonName, addonNamespace string,
+	works []*workapiv1.ManifestWork) error {
+	var errs []error
+	for _, work := range works {
+		if !isAddonFrameworkWork(work) {
+			continue
+		}
+		if err := deleteWork(ctx, work.Namespace, work.Name); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := utilerrors.NewAggregate(errs); err != nil {
+		return err
+	}
+
+	liveWorks, err := listWorks(ctx, addonName, addonNamespace)
+	if err != nil {
+		return err
+	}
+	for _, work := range liveWorks {
+		if !isAddonFrameworkWork(work) {
+			continue
+		}
+		if work.DeletionTimestamp.IsZero() {
+			return fmt.Errorf("manifestWork %s/%s is not deleted yet", work.Namespace, work.Name)
+		}
+	}
+	return nil
+}
+
+func setHookManifestNotCompletedCondition(addon *addonapiv1beta1.ManagedClusterAddOn, hookWorkName string) {
+	meta.SetStatusCondition(&addon.Status.Conditions, metav1.Condition{
+		Type:    addonapiv1beta1.ManagedClusterAddOnHookManifestCompleted,
+		Status:  metav1.ConditionFalse,
+		Reason:  "HookManifestIsNotCompleted",
+		Message: fmt.Sprintf("hook manifestWork %v is not completed.", hookWorkName),
+	})
+}
+
+func addonHasPreDeleteHookFinalizer(addon *addonapiv1beta1.ManagedClusterAddOn) bool {
+	return addonHasFinalizer(addon, addonapiv1beta1.AddonPreDeleteHookFinalizer) ||
+		addonHasFinalizer(addon, addonapiv1beta1.AddonHostingPreDeleteHookFinalizer)
+}
+
+func addonHasHostingFinalizer(addon *addonapiv1beta1.ManagedClusterAddOn) bool {
+	return addonHasFinalizer(addon, addonapiv1beta1.AddonHostingPreDeleteHookFinalizer) ||
+		addonHasFinalizer(addon, addonapiv1beta1.AddonHostingManifestFinalizer)
+}
+
+func newManifestWork(addon *addonapiv1beta1.ManagedClusterAddOn, clusterName string, manifests []workapiv1.Manifest,
 	manifestWorkNameFunc func(addonNamespace, addonName string) string) *workapiv1.ManifestWork {
 	if len(manifests) == 0 {
 		return nil
@@ -89,11 +192,9 @@ func newManifestWork(addonNamespace, addonName, clusterName string, manifests []
 
 	work := &workapiv1.ManifestWork{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      manifestWorkNameFunc(addonNamespace, addonName),
+			Name:      manifestWorkNameFunc(addon.Namespace, addon.Name),
 			Namespace: clusterName,
-			Labels: map[string]string{
-				addonapiv1beta1.AddonLabelKey: addonName,
-			},
+			Labels:    newAddonWorkLabels(addon, clusterName),
 		},
 		Spec: workapiv1.ManifestWorkSpec{
 			Workload: workapiv1.ManifestsTemplate{
@@ -102,10 +203,6 @@ func newManifestWork(addonNamespace, addonName, clusterName string, manifests []
 		},
 	}
 
-	// if the addon namespace is not equal with the manifestwork namespace(cluster name), add the addon namespace label
-	if addonNamespace != clusterName {
-		work.Labels[addonapiv1beta1.AddonNamespaceLabelKey] = addonNamespace
-	}
 	return work
 }
 
@@ -262,8 +359,8 @@ func (m *managedManifest) preDeleteHookManifestWorkName(addonNamespace, addonNam
 	return constants.PreDeleteHookWorkName(addonName)
 }
 
-// BuildDeployWorks returns the deploy manifestWorks. if there is no manifest need
-// to deploy, will return nil.
+// BuildDeployWorks returns the deploy manifestWorks. if there is no manifest need to deploy, the
+// existing works are all returned as deleteWorks.
 func (b *addonWorksBuilder) BuildDeployWorks(installMode, addonWorkNamespace string,
 	addon *addonapiv1beta1.ManagedClusterAddOn,
 	existingWorks []workapiv1.ManifestWork,
@@ -273,11 +370,7 @@ func (b *addonWorksBuilder) BuildDeployWorks(installMode, addonWorkNamespace str
 	// This owner is only added to the manifestWork deployed in managed cluster ns.
 	// the manifestWork in managed cluster ns is cleaned up via the addon ownerRef, so need to add the owner.
 	// the manifestWork in hosting cluster ns is cleaned up by its controller since it and its addon cross ns.
-	owner := metav1.NewControllerRef(addon, schema.GroupVersionKind{
-		Group:   addonapiv1beta1.GroupName,
-		Version: addonapiv1beta1.GroupVersion.Version,
-		Kind:    "ManagedClusterAddOn",
-	})
+	owner := newAddonOwnerRef(addon)
 
 	var deletionOrphaningRules []workapiv1.OrphaningRule
 	for _, object := range objects {
@@ -304,10 +397,6 @@ func (b *addonWorksBuilder) BuildDeployWorks(installMode, addonWorkNamespace str
 
 		deployObjects = append(deployObjects, object)
 	}
-	if len(deployObjects) == 0 {
-		return nil, nil, nil
-	}
-
 	var deletionOption *workapiv1.DeleteOption
 	if len(deletionOrphaningRules) != 0 {
 		deletionOption = &workapiv1.DeleteOption{
@@ -324,7 +413,8 @@ func (b *addonWorksBuilder) BuildDeployWorks(installMode, addonWorkNamespace str
 	}
 
 	return b.workBuilder.Build(deployObjects,
-		newAddonWorkObjectMeta(b.processor.manifestWorkNamePrefix(addon.Namespace, addon.Name), addon.Name, addon.Namespace, addonWorkNamespace, owner),
+		newAddonWorkObjectMeta(
+			b.processor.manifestWorkNamePrefix(addon.Namespace, addon.Name), addon, addonWorkNamespace, owner),
 		workbuilder.ExistingManifestWorksOption(existingWorks),
 		workbuilder.ManifestConfigOption(manifestOptions),
 		workbuilder.ManifestAnnotations(annotations),
@@ -339,11 +429,7 @@ func (b *addonWorksBuilder) BuildHookWork(installMode, addonWorkNamespace string
 	var hookManifests []workapiv1.Manifest
 	var hookManifestConfigs []workapiv1.ManifestConfigOption
 
-	owner := metav1.NewControllerRef(addon, schema.GroupVersionKind{
-		Group:   addonapiv1beta1.GroupName,
-		Version: addonapiv1beta1.GroupVersion.Version,
-		Kind:    "ManagedClusterAddOn",
-	})
+	owner := newAddonOwnerRef(addon)
 
 	for _, object := range objects {
 		deployable, err := b.processor.deployable(b.hostedModeEnabled, installMode, object)
@@ -370,16 +456,13 @@ func (b *addonWorksBuilder) BuildHookWork(installMode, addonWorkNamespace string
 		return nil, nil
 	}
 
-	hookWork = newManifestWork(addon.Namespace, addon.Name, addonWorkNamespace, hookManifests, b.processor.preDeleteHookManifestWorkName)
+	hookWork = newManifestWork(addon, addonWorkNamespace, hookManifests, b.processor.preDeleteHookManifestWorkName)
 
 	// This owner is only added to the manifestWork deployed in managed cluster ns.
 	if addon.Namespace == addonWorkNamespace {
 		hookWork.OwnerReferences = []metav1.OwnerReference{*owner}
 	}
 	hookWork.Spec.ManifestConfigs = hookManifestConfigs
-	if addon.Namespace != addonWorkNamespace {
-		hookWork.Labels[addonapiv1beta1.AddonNamespaceLabelKey] = addon.Namespace
-	}
 	return hookWork, nil
 }
 
@@ -457,28 +540,43 @@ func hookWorkIsCompleted(hookWork *workapiv1.ManifestWork) bool {
 	return true
 }
 
-func newAddonWorkObjectMeta(namePrefix, addonName, addonNamespace, workNamespace string,
+func newAddonWorkObjectMeta(namePrefix string, addon *addonapiv1beta1.ManagedClusterAddOn, workNamespace string,
 	owner *metav1.OwnerReference) workbuilder.GenerateManifestWorkObjectMeta {
 	return func(index int) metav1.ObjectMeta {
 		objectMeta := metav1.ObjectMeta{
 			Name:      fmt.Sprintf("%s-%d", namePrefix, index),
 			Namespace: workNamespace,
-			Labels: map[string]string{
-				addonapiv1beta1.AddonLabelKey: addonName,
-			},
+			Labels:    newAddonWorkLabels(addon, workNamespace),
 		}
 		// This owner is only added to the manifestWork deployed in managed cluster ns.
 		// the manifestWork in managed cluster ns is cleaned up via the addon ownerRef, so need to add the owner.
 		// the manifestWork in hosting cluster ns is cleaned up by its controller since it and its addon cross ns.
-		if addonNamespace == workNamespace && owner != nil {
+		if addon.Namespace == workNamespace && owner != nil {
 			objectMeta.OwnerReferences = []metav1.OwnerReference{*owner}
-		}
-		// if the addon namespace is not equal with the manifestwork namespace(cluster name), add the addon namespace label
-		if addonNamespace != workNamespace {
-			objectMeta.Labels[addonapiv1beta1.AddonNamespaceLabelKey] = addonNamespace
 		}
 		return objectMeta
 	}
+}
+
+func newAddonWorkLabels(addon *addonapiv1beta1.ManagedClusterAddOn, workNamespace string) map[string]string {
+	labels := map[string]string{
+		addonapiv1beta1.AddonLabelKey:             addon.Name,
+		constants.AddonFrameworkManagedByLabelKey: constants.AddonFrameworkManagedByLabelValue,
+		constants.AddonSourceUIDLabelKey:          string(addon.UID),
+	}
+	// if the addon namespace is not equal with the manifestwork namespace(cluster name), add the addon namespace label
+	if addon.Namespace != workNamespace {
+		labels[addonapiv1beta1.AddonNamespaceLabelKey] = addon.Namespace
+	}
+	return labels
+}
+
+func newAddonOwnerRef(addon *addonapiv1beta1.ManagedClusterAddOn) *metav1.OwnerReference {
+	return metav1.NewControllerRef(addon, schema.GroupVersionKind{
+		Group:   addonapiv1beta1.GroupName,
+		Version: addonapiv1beta1.GroupVersion.Version,
+		Kind:    "ManagedClusterAddOn",
+	})
 }
 
 func getManifestConfigOption(ctx context.Context, agentAddon agent.AgentAddon,

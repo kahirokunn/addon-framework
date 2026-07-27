@@ -2,10 +2,6 @@ package agentdeploy
 
 import (
 	"context"
-	"fmt"
-
-	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	addonapiv1beta1 "open-cluster-management.io/api/addon/v1beta1"
 	clusterv1 "open-cluster-management.io/api/cluster/v1"
@@ -38,11 +34,13 @@ func (s *defaultHookSyncer) sync(ctx context.Context,
 		return addon, nil
 	}
 
-	if addonAddFinalizer(addon, addonapiv1beta1.AddonPreDeleteHookFinalizer) {
+	if addon.DeletionTimestamp.IsZero() {
+		addonAddFinalizer(addon, addonapiv1beta1.AddonPreDeleteHookFinalizer)
 		return addon, nil
 	}
 
-	if addon.DeletionTimestamp.IsZero() {
+	// the hook has already been completed if the finalizer is gone, do not apply the hook work again.
+	if !addonHasFinalizer(addon, addonapiv1beta1.AddonPreDeleteHookFinalizer) {
 		return addon, nil
 	}
 
@@ -54,23 +52,10 @@ func (s *defaultHookSyncer) sync(ctx context.Context,
 
 	// TODO: will surface more message here
 	if hookWorkIsCompleted(hookWork) {
-		meta.SetStatusCondition(&addon.Status.Conditions, metav1.Condition{
-			Type:    addonapiv1beta1.ManagedClusterAddOnHookManifestCompleted,
-			Status:  metav1.ConditionTrue,
-			Reason:  "HookManifestIsCompleted",
-			Message: fmt.Sprintf("hook manifestWork %v is completed.", hookWork.Name),
-		})
-
 		addonRemoveFinalizer(addon, addonapiv1beta1.AddonPreDeleteHookFinalizer)
 		return addon, nil
 	}
 
-	meta.SetStatusCondition(&addon.Status.Conditions, metav1.Condition{
-		Type:    addonapiv1beta1.ManagedClusterAddOnHookManifestCompleted,
-		Status:  metav1.ConditionFalse,
-		Reason:  "HookManifestIsNotCompleted",
-		Message: fmt.Sprintf("hook manifestWork %v is not completed.", hookWork.Name),
-	})
-
+	setHookManifestNotCompletedCondition(addon, hookWork.Name)
 	return addon, nil
 }

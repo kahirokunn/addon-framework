@@ -32,8 +32,6 @@ func (s *defaultSyncer) sync(ctx context.Context,
 	addon *addonapiv1beta1.ManagedClusterAddOn) (*addonapiv1beta1.ManagedClusterAddOn, error) {
 	deployWorkNamespace := addon.Namespace
 
-	var errs []error
-
 	// Don't skip syncing if the addon is deleting and there is a predelete hook, since the deployment manifests may
 	// need to be updated during the uninstall.
 	if !addonHasFinalizer(addon, addonapiv1beta1.AddonPreDeleteHookFinalizer) {
@@ -52,19 +50,23 @@ func (s *defaultSyncer) sync(ctx context.Context,
 	if err != nil {
 		return addon, err
 	}
+	currentWorks, staleWorks := partitionWorksForTarget(addon, deployWorkNamespace, currentWorks)
 
 	deployWorks, deleteWorks, err := s.buildWorks(ctx, deployWorkNamespace, cluster, currentWorks, addon)
 	if err != nil {
 		return addon, err
 	}
+	deleteWorks = append(staleWorks, deleteWorks...)
 
+	// the works of the previous install mode are deleted before the new ones are applied, so that a
+	// work is never applied in the new namespace while the old one still exists.
 	for _, deleteWork := range deleteWorks {
-		err = s.deleteWork(ctx, deployWorkNamespace, deleteWork.Name)
-		if err != nil {
-			errs = append(errs, err)
+		if err = s.deleteWork(ctx, deleteWork.Namespace, deleteWork.Name); err != nil {
+			return addon, err
 		}
 	}
 
+	var errs []error
 	for _, deployWork := range deployWorks {
 		_, err = s.applyWork(ctx, addonapiv1beta1.ManagedClusterAddOnManifestApplied, deployWork, addon)
 		if err != nil {
