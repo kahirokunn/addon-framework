@@ -40,13 +40,12 @@ func IndexManifestWorkByAddon(obj interface{}) ([]string, error) {
 		return []string{}, fmt.Errorf("obj is supposed to be a ManifestWork, but is %T", obj)
 	}
 
-	addonName, addonNamespace, isHook := extractAddonFromWork(work)
-
-	if len(addonName) == 0 || len(addonNamespace) > 0 || isHook {
+	ref, ok := ExtractAddonFromWork(work)
+	if !ok || !ref.IsDefaultDeployWork() {
 		return []string{}, nil
 	}
 
-	return []string{fmt.Sprintf("%s/%s", work.Namespace, addonName)}, nil
+	return []string{ref.Key()}, nil
 }
 
 //nolint:revive
@@ -56,13 +55,12 @@ func IndexManifestWorkByHostedAddon(obj interface{}) ([]string, error) {
 		return []string{}, fmt.Errorf("obj is supposed to be a ManifestWork, but is %T", obj)
 	}
 
-	addonName, addonNamespace, isHook := extractAddonFromWork(work)
-
-	if len(addonName) == 0 || len(addonNamespace) == 0 || isHook {
+	ref, ok := ExtractAddonFromWork(work)
+	if !ok || !ref.IsHostedDeployWork() {
 		return []string{}, nil
 	}
 
-	return []string{fmt.Sprintf("%s/%s", addonNamespace, addonName)}, nil
+	return []string{ref.Key()}, nil
 }
 
 //nolint:revive
@@ -72,30 +70,71 @@ func IndexManifestWorkHookByHostedAddon(obj interface{}) ([]string, error) {
 		return []string{}, fmt.Errorf("obj is supposed to be a ManifestWork, but is %T", obj)
 	}
 
-	addonName, addonNamespace, isHook := extractAddonFromWork(work)
-
-	if len(addonName) == 0 || len(addonNamespace) == 0 || !isHook {
+	ref, ok := ExtractAddonFromWork(work)
+	if !ok || !ref.IsHostedHookWork() {
 		return []string{}, nil
 	}
 
-	return []string{fmt.Sprintf("%s/%s", addonNamespace, addonName)}, nil
+	return []string{ref.Key()}, nil
 }
 
-func extractAddonFromWork(work *workapiv1.ManifestWork) (string, string, bool) {
-	if len(work.Labels) == 0 {
-		return "", "", false
-	}
+// AddonWorkRef is the addon a manifestWork is applied for.
+type AddonWorkRef struct {
+	Name      string
+	Namespace string
+	Hosted    bool
+	Deploy    bool
+	Hook      bool
+}
 
+// Key returns the index key of the addon, in format: addonNamespace/addonName.
+func (r AddonWorkRef) Key() string {
+	return fmt.Sprintf("%s/%s", r.Namespace, r.Name)
+}
+
+// IsAddonWork returns true if the manifestWork is applied by the addon framework.
+func (r AddonWorkRef) IsAddonWork() bool {
+	return r.Deploy || r.Hook
+}
+
+// IsDefaultDeployWork returns true if the manifestWork is a deploy work in the addon namespace.
+func (r AddonWorkRef) IsDefaultDeployWork() bool {
+	return r.Deploy && !r.Hosted
+}
+
+// IsHostedDeployWork returns true if the manifestWork is a deploy work in a hosting cluster namespace.
+func (r AddonWorkRef) IsHostedDeployWork() bool {
+	return r.Deploy && r.Hosted
+}
+
+// IsHostedHookWork returns true if the manifestWork is a pre-delete hook work in a hosting cluster namespace.
+func (r AddonWorkRef) IsHostedHookWork() bool {
+	return r.Hook && r.Hosted
+}
+
+// ExtractAddonFromWork returns the addon a manifestWork is applied for, and whether the work is
+// applied by the addon framework.
+func ExtractAddonFromWork(work *workapiv1.ManifestWork) (AddonWorkRef, bool) {
 	addonName, ok := work.Labels[addonv1beta1.AddonLabelKey]
 	if !ok {
-		return "", "", false
+		return AddonWorkRef{}, false
 	}
 
+	// in hosted mode, the addon namespace is recorded in the AddonNamespaceLabel, because the
+	// namespaces of manifestWork and addon may be different.
+	// in default mode, the addon and manifestWork are in the cluster namespace.
 	addonNamespace := work.Labels[addonv1beta1.AddonNamespaceLabelKey]
+	if addonNamespace == "" {
+		addonNamespace = work.Namespace
+	}
 
-	isHook := strings.HasPrefix(work.Name, constants.PreDeleteHookWorkName(addonName))
-
-	return addonName, addonNamespace, isHook
+	return AddonWorkRef{
+		Name:      addonName,
+		Namespace: addonNamespace,
+		Hosted:    addonNamespace != work.Namespace,
+		Deploy:    strings.HasPrefix(work.Name, constants.DeployWorkNamePrefix(addonName)),
+		Hook:      strings.HasPrefix(work.Name, constants.PreDeleteHookWorkName(addonName)),
+	}, true
 }
 
 const (
